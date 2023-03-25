@@ -647,6 +647,7 @@ HANDLE WINAPI CreateRemoteThreadEx_Hook(HANDLE hProcess, LPSECURITY_ATTRIBUTES l
 	return hThread;
 }
 
+// NOTE: This is a buffer (structure) that is passed to CallVM and its address is located in the SecureEngine.
 #pragma pack(push, 1)
 typedef struct _OREANS_BUFFER {
 	unsigned short m_unV1;
