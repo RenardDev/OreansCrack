@@ -20,8 +20,11 @@ bool g_bStop = false;
 enum class PRODUCT_TYPE : unsigned char {
 	UNKNOWN = 0,
 	CODE_VIRTUALIZER = 1,
-	THEMIDA = 2,
-	WINLICENSE = 3
+	CODE_VIRTUALIZER64 = 2,
+	THEMIDA = 3,
+	THEMIDA64 = 4,
+	WINLICENSE = 5,
+	WINLICENSE64 = 6
 };
 
 typedef LONG(NTAPI* fnNtFlushInstructionCache)(HANDLE ProcessHandle, PVOID BaseAddress, ULONG NumberOfBytesToFlush);
@@ -549,8 +552,18 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 				continue;
 			}
 
+			if (_tcscmp(pArg, _T("/cv64")) == 0) {
+				unProductType = PRODUCT_TYPE::CODE_VIRTUALIZER64;
+				continue;
+			}
+
 			if (_tcscmp(pArg, _T("/th")) == 0) {
 				unProductType = PRODUCT_TYPE::THEMIDA;
+				continue;
+			}
+
+			if (_tcscmp(pArg, _T("/th64")) == 0) {
+				unProductType = PRODUCT_TYPE::THEMIDA64;
 				continue;
 			}
 
@@ -558,10 +571,16 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 				unProductType = PRODUCT_TYPE::WINLICENSE;
 				continue;
 			}
+
+			if (_tcscmp(pArg, _T("/wl64")) == 0) {
+				unProductType = PRODUCT_TYPE::WINLICENSE64;
+				continue;
+			}
 		}
 
 		if (unProductType == PRODUCT_TYPE::UNKNOWN) {
-			tclrprintf(COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|th|wl] <args>\n"), szMainFile);
+			//tclrprintf(COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|cv64|th|th64|wl|wl64] <args to parse in product>\n"), szMainFile);
+			tclrprintf(COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|cv64|th|th64|wl|wl64]\n"), szMainFile);
 			return -1;
 		}
 
@@ -610,6 +629,13 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 			}
 		}
 
+		if (unProductType == PRODUCT_TYPE::CODE_VIRTUALIZER64) {
+			if (!CreateProcess(_T("Virtualizer64.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				return -1;
+			}
+		}
+
 		if (unProductType == PRODUCT_TYPE::THEMIDA) {
 			if (!CreateProcess(_T("Themida.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
 				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
@@ -617,8 +643,22 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 			}
 		}
 
+		if (unProductType == PRODUCT_TYPE::THEMIDA64) {
+			if (!CreateProcess(_T("Themida64.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				return -1;
+			}
+		}
+
 		if (unProductType == PRODUCT_TYPE::WINLICENSE) {
 			if (!CreateProcess(_T("WinLicense.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				return -1;
+			}
+		}
+
+		if (unProductType == PRODUCT_TYPE::WINLICENSE64) {
+			if (!CreateProcess(_T("WinLicense64.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
 				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
 				return -1;
 			}
