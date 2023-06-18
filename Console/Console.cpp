@@ -510,7 +510,7 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 		T.ChangeColorPalette(COLOR::COLOR_YELLOW, 0xFFFF00);
 		T.ChangeColorPalette(COLOR::COLOR_WHITE, 0xFAFAFA);
 
-		tclrprintf(COLOR::COLOR_WHITE, _T("OreansConsole [Version 1.0.0] (zeze839@gmail.com)\n\n"));
+		tclrprintf(COLOR::COLOR_WHITE, _T("OreansConsole [Version 1.0.1] (zeze839@gmail.com)\n\n"));
 
 		TCHAR szMainFileName[16];
 		memset(szMainFileName, 0, sizeof(szMainFileName));

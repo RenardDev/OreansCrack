@@ -499,7 +499,7 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 				}
 
 				default: {
-					//pVM(unIndex, pData);
+					pVM(unIndex, pData);
 
 					clrprintf(COLOR::COLOR_RED, "[+] CallMacro (ID=0x%02X)\n", unMacroIndex);
 					clrprintf(COLOR::COLOR_RED, "[+]  Data: %08X (%08X)\n", pMacroResult, *pMacroResult);
@@ -687,7 +687,7 @@ DWORD WINAPI MainRoutine(LPVOID lpThreadParameter) {
 
 	g_pSelf = GetModuleHandle(nullptr);
 
-	clrprintf(COLOR::COLOR_WHITE, "OreansCrack [Version 1.0.0] (zeze839@gmail.com)\n\n");
+	clrprintf(COLOR::COLOR_WHITE, "OreansCrack [Version 1.0.1] (zeze839@gmail.com)\n\n");
 	clrprintf(COLOR::COLOR_WHITE, "[OreansCrack] Loading... ");
 
 	HMODULE hNTDLL = GetModuleHandle(_T("ntdll.dll"));
