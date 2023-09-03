@@ -30,6 +30,8 @@ typedef struct _LOADER_DATA {
 	void* m_pMemoryAddress;
 	size_t m_unMemorySize;
 	char m_pLoaderPath[1024];
+	// Terminal Session Name
+	TCHAR m_pSessionName[64];
 } LOADER_DATA, *PLOADER_DATA;
 
 #endif // !_LOADER_H_

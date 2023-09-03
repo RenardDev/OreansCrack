@@ -4,27 +4,23 @@
 #include <tchar.h>
 #include <Psapi.h>
 
-// Custom
-#include "ConsoleUtils.h"
+// Terminal
+#include "Terminal.h"
+
+// Detours
 #include "Detours.h"
 
-// Namespaces
-using namespace ConsoleUtils;
-using namespace Detours;
-
+// ----------------------------------------------------------------
 // General definitions
-
-bool g_bIsValidLaunch = false;
-bool g_bStop = false;
+// ----------------------------------------------------------------
 
 enum class PRODUCT_TYPE : unsigned char {
 	UNKNOWN = 0,
 	CODE_VIRTUALIZER = 1,
-	CODE_VIRTUALIZER64 = 2,
-	THEMIDA = 3,
-	THEMIDA64 = 4,
-	WINLICENSE = 5,
-	WINLICENSE64 = 6
+	THEMIDA = 2,
+	THEMIDA64 = 3,
+	WINLICENSE = 4,
+	WINLICENSE64 = 5
 };
 
 typedef LONG(NTAPI* fnNtFlushInstructionCache)(HANDLE ProcessHandle, PVOID BaseAddress, ULONG NumberOfBytesToFlush);
@@ -42,13 +38,12 @@ typedef struct _LOADER_DATA {
 	void* m_pMemoryAddress;
 	size_t m_unMemorySize;
 	char m_pLoaderPath[1024];
+	// Terminal Session Name
+	TCHAR m_pSessionName[64];
 } LOADER_DATA, *PLOADER_DATA;
 
-typedef struct _CONSOLE_MESSAGE {
-	char m_pMessage[1024];
-	COLOR_PAIR m_ColorPair;
-} CONSOLE_MESSAGE, *PCONSOLE_MESSAGE;
-
+bool g_bIsValidLaunch = false;
+bool g_bStop = false;
 
 size_t GetExportOffset(void* pMemory, const size_t unSize, const char* szExportName) {
 	if (!pMemory) {
@@ -135,7 +130,7 @@ size_t GetExportOffset(void* pMemory, const size_t unSize, const char* szExportN
 	return 0;
 }
 
-bool InjectLibrary(const HANDLE hProcess, const HANDLE hProcessThread, void* pMemory, const size_t unSize, PLOADER_DATA pLoaderData) {
+bool InjectLibrary(Terminal::Console& Console, Terminal::Server& TerminalServer, const HANDLE hProcess, const HANDLE hProcessThread, void* pMemory, const size_t unSize, PLOADER_DATA pLoaderData) {
 	if (!hProcess) {
 		return false;
 	}
@@ -149,48 +144,48 @@ bool InjectLibrary(const HANDLE hProcess, const HANDLE hProcessThread, void* pMe
 	}
 
 	if (unSize < sizeof(IMAGE_DOS_HEADER)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (File is too small)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (File is too small)\n"));
 		return false;
 	}
 
 	const PIMAGE_DOS_HEADER pDH = reinterpret_cast<PIMAGE_DOS_HEADER>(pMemory);
 	if (pDH->e_magic != IMAGE_DOS_SIGNATURE) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid DOS signature)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid DOS signature)\n"));
 		return false;
 	}
 
 	if (unSize < pDH->e_lfanew + sizeof(IMAGE_NT_HEADERS)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (File is too small)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (File is too small)\n"));
 		return false;
 	}
 
 	const PIMAGE_NT_HEADERS pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(pMemory) + pDH->e_lfanew);
 	if (pNTHs->Signature != IMAGE_NT_SIGNATURE) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid PE signature)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid PE signature)\n"));
 		return false;
 	}
 
 	const PIMAGE_FILE_HEADER pFH = &(pNTHs->FileHeader);
 #ifdef _WIN64
 	if (pFH->Machine != IMAGE_FILE_MACHINE_AMD64) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid platform)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid platform)\n"));
 		return false;
 	}
 
 	const PIMAGE_OPTIONAL_HEADER64 pOH = reinterpret_cast<PIMAGE_OPTIONAL_HEADER64>(&(pNTHs->OptionalHeader));
 	if (pOH->Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid optional PE signature)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid optional PE signature)\n"));
 		return false;
 	}
 #elif _WIN32
 	if (pFH->Machine != IMAGE_FILE_MACHINE_I386) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid platform)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid platform)\n"));
 		return false;
 	}
 
 	const PIMAGE_OPTIONAL_HEADER32 pOH = reinterpret_cast<PIMAGE_OPTIONAL_HEADER32>(&(pNTHs->OptionalHeader));
 	if (pOH->Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid optional PE signature)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid optional PE signature)\n"));
 		return false;
 	}
 #else
@@ -199,18 +194,18 @@ bool InjectLibrary(const HANDLE hProcess, const HANDLE hProcessThread, void* pMe
 
 	const size_t unLoaderOffset = GetExportOffset(pMemory, unSize, "?LibraryMain@@YGKPAX@Z");
 	if (!unLoaderOffset) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Loader not found)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Loader not found)\n"));
 		return false;
 	}
 
 	void* pBuffer = VirtualAllocEx(hProcess, nullptr, unSize + sizeof(LOADER_DATA), MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 	if (!pBuffer) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Unable to allocate memory)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Unable to allocate memory)\n"));
 		return false;
 	}
 
 	if (!WriteProcessMemory(hProcess, pBuffer, pMemory, unSize, nullptr)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Unable to write memory)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Unable to write memory)\n"));
 		return false;
 	}
 
@@ -220,7 +215,7 @@ bool InjectLibrary(const HANDLE hProcess, const HANDLE hProcessThread, void* pMe
 	char szBuffer[sizeof(LOADER_DATA::m_pLoaderPath)];
 	memset(szBuffer, 0, sizeof(szBuffer));
 	if (!GetModuleFileNameA(nullptr, szBuffer, sizeof(szBuffer))) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Unknown path)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Unknown path)\n"));
 		return false;
 	}
 
@@ -229,7 +224,7 @@ bool InjectLibrary(const HANDLE hProcess, const HANDLE hProcessThread, void* pMe
 	char szDirFile[sizeof(LOADER_DATA::m_pLoaderPath) / 2];
 	memset(szDirFile, 0, sizeof(szDirFile));
 	if (_splitpath_s(szBuffer, szDriveFile, sizeof(szDriveFile) - 1, szDirFile, sizeof(szDirFile) - 1, nullptr, 0, nullptr, 0)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Unknown path)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Unknown path)\n"));
 		return false;
 	}
 
@@ -238,14 +233,22 @@ bool InjectLibrary(const HANDLE hProcess, const HANDLE hProcessThread, void* pMe
 
 	memcpy(pLoaderData->m_pLoaderPath, szBuffer, sizeof(LOADER_DATA::m_pLoaderPath));
 
+	TCHAR szSessionName[64];
+	if (!TerminalServer.GetSessionName(szSessionName)) {
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to get session name\n"));
+		return false;
+	}
+
+	memcpy(pLoaderData->m_pSessionName, szSessionName, sizeof(LOADER_DATA::m_pSessionName));
+
 	if (!WriteProcessMemory(hProcess, reinterpret_cast<char*>(pBuffer) + unSize, pLoaderData, sizeof(LOADER_DATA), nullptr)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Unable to write memory)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Unable to write memory)\n"));
 		return false;
 	}
 
 	HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0x100000 /* 1 MiB */, reinterpret_cast<LPTHREAD_START_ROUTINE>(reinterpret_cast<size_t>(pBuffer) + unLoaderOffset), reinterpret_cast<char*>(pBuffer) + unSize, CREATE_SUSPENDED, nullptr);
 	if (!hThread || (hThread == INVALID_HANDLE_VALUE)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid thread handle)\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid thread handle)\n"));
 		return false;
 	}
 
@@ -258,31 +261,31 @@ bool InjectLibrary(const HANDLE hProcess, const HANDLE hProcessThread, void* pMe
 	return true;
 }
 
-bool FileRead(const TCHAR* szPath, PHANDLE phHeap, LPVOID* ppMemory, PDWORD punFileSize) {
+bool FileRead(Terminal::Console& Console, const TCHAR* szPath, PHANDLE phHeap, LPVOID* ppMemory, PDWORD punFileSize) {
 	const HANDLE hFile = CreateFile(szPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (!hFile || (hFile == INVALID_HANDLE_VALUE)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateFile` (LastError = 0x%08X)\n"), GetLastError());
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `CreateFile` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
 
 	const DWORD unFileSize = GetFileSize(hFile, nullptr);
 	if (!unFileSize || (unFileSize == INVALID_FILE_SIZE)) {
 		CloseHandle(hFile);
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `GetFileSize` (LastError = 0x%08X)\n"), GetLastError());
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `GetFileSize` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
 
 	const HANDLE hHeap = GetProcessHeap();
 	if (!hHeap || (hHeap == INVALID_HANDLE_VALUE)) {
 		CloseHandle(hFile);
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `GetProcessHeap` (LastError = 0x%08X)\n"), GetLastError());
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `GetProcessHeap` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
 
 	void* pMemory = HeapAlloc(hHeap, HEAP_ZERO_MEMORY, unFileSize);
 	if (!pMemory) {
 		CloseHandle(hFile);
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `HeapAlloc` (LastError = 0x%08X)\n"), GetLastError());
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `HeapAlloc` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
 
@@ -290,11 +293,11 @@ bool FileRead(const TCHAR* szPath, PHANDLE phHeap, LPVOID* ppMemory, PDWORD punF
 	if (!ReadFile(hFile, pMemory, unFileSize, &unNumberOfBytesRead, nullptr) && (unFileSize != unNumberOfBytesRead)) {
 		if (!HeapFree(hHeap, NULL, pMemory)) {
 			CloseHandle(hFile);
-			tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `HeapFree` (LastError = 0x%08X)\n"), GetLastError());
+			Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `HeapFree` (LastError = 0x%08X)\n"), GetLastError());
 			return false;
 		}
 		CloseHandle(hFile);
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `HeapAlloc` (LastError = 0x%08X)\n"), GetLastError());
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `HeapAlloc` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
 
@@ -308,7 +311,7 @@ bool FileRead(const TCHAR* szPath, PHANDLE phHeap, LPVOID* ppMemory, PDWORD punF
 		*ppMemory = pMemory;
 	} else {
 		if (!HeapFree(hHeap, NULL, pMemory)) {
-			tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `HeapFree` (LastError = 0x%08X)\n"), GetLastError());
+			Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `HeapFree` (LastError = 0x%08X)\n"), GetLastError());
 			return false;
 		}
 	}
@@ -320,7 +323,7 @@ bool FileRead(const TCHAR* szPath, PHANDLE phHeap, LPVOID* ppMemory, PDWORD punF
 	return true;
 }
 
-bool HackProcess(const HANDLE hProcess, const HANDLE hProcessThread) {
+bool HackProcess(Terminal::Console& Console, Terminal::Server& TerminalServer, const HANDLE hProcess, const HANDLE hProcessThread) {
 	if (!hProcess) {
 		return false;
 	}
@@ -372,145 +375,56 @@ bool HackProcess(const HANDLE hProcess, const HANDLE hProcessThread) {
 	LPVOID pMemory = nullptr;
 	DWORD unFileSize = 0;
 
-	if (!FileRead(_T("Library.dll"), &hHeap, &pMemory, &unFileSize)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `FileRead` (LastError = 0x%08X)\n"), GetLastError());
+	if (!FileRead(Console, _T("Library.dll"), &hHeap, &pMemory, &unFileSize)) {
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `FileRead` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
 
-	if (!InjectLibrary(hProcess, hProcessThread, pMemory, unFileSize, &LoaderData)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `InjectLibrary` (LastError = 0x%08X)\n"), GetLastError());
+	if (!InjectLibrary(Console, TerminalServer, hProcess, hProcessThread, pMemory, unFileSize, &LoaderData)) {
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `InjectLibrary` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
 
-	tclrprintf(COLOR::COLOR_GREEN, _T("[+] Library injected!\n"));
-	tclrprintf(COLOR::COLOR_GREEN, _T("[+]  > Base = 0x%08X\n"), reinterpret_cast<unsigned int>(LoaderData.m_pMemoryAddress));
-	tclrprintf(COLOR::COLOR_GREEN, _T("[+]  > Size = 0x%08X\n"), LoaderData.m_unMemorySize);
+	Console.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[+] Library injected!\n"));
+	Console.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[+]  > Base = 0x%08X\n"), reinterpret_cast<unsigned int>(LoaderData.m_pMemoryAddress));
+	Console.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[+]  > Size = 0x%08X\n"), LoaderData.m_unMemorySize);
 
 	if (!HeapFree(hHeap, NULL, pMemory)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `HeapFree` (LastError = 0x%08X)\n"), GetLastError());
+		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `HeapFree` (LastError = 0x%08X)\n"), GetLastError());
 		return false;
 	}
-
-	return true;
-}
-
-bool ConnectToProcess() {
-
-	tclrprintf(COLOR::COLOR_CYAN, _T("[i] Connecting to process... "));
-
-	unsigned char unCount = 0;
-	HANDLE hPipe = INVALID_HANDLE_VALUE;
-	while (!hPipe || (hPipe == INVALID_HANDLE_VALUE)) {
-		if (unCount >= 30) {
-			tclrprintf(COLOR::COLOR_RED, _T("[ FAIL ]\n"));
-			return false;
-		}
-		++unCount;
-		hPipe = CreateFile(_T("\\\\.\\pipe\\OreansCrack"), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-		Sleep(1000);
-	}
-
-	tclrprintf(COLOR::COLOR_GREEN, _T("[  OK  ]\n\n"));
-
-	HANDLE hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-	if (!hEvent || (hEvent == INVALID_HANDLE_VALUE)) {
-		tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateEvent` (LastError = 0x%08X)\n"), GetLastError());
-		return false;
-	}
-
-	OVERLAPPED ol;
-	memset(&ol, 0, sizeof(ol));
-
-	ol.hEvent = hEvent;
-
-	CONSOLE_MESSAGE Message;
-
-	bool bContinue = true;
-	while (bContinue && !g_bStop) {
-		bContinue = false;
-		memset(&Message, 0, sizeof(Message));
-		DWORD unNumberOfBytesRead = 0;
-		if (!ReadFile(hPipe, &Message, sizeof(Message), &unNumberOfBytesRead, &ol)) {
-			switch (GetLastError()) {
-				case ERROR_HANDLE_EOF: {
-					break;
-				}
-				case ERROR_IO_PENDING: {
-					bool bPending = true;
-					while (bPending && !g_bStop) {
-						bPending = false;
-						if (!GetOverlappedResult(hPipe, &ol, &unNumberOfBytesRead, FALSE)) {
-							switch (GetLastError()) {
-								case ERROR_HANDLE_EOF: {
-									break;
-								}
-								case ERROR_IO_INCOMPLETE: {
-									bPending = true;
-									bContinue = true;
-									break;
-								}
-							}
-						} else {
-							if (unNumberOfBytesRead == sizeof(CONSOLE_MESSAGE)) {
-								Message.m_pMessage[sizeof(Message.m_pMessage) - 1] = '\0';
-								if (strnlen_s(Message.m_pMessage, sizeof(Message.m_pMessage)) > 0) {
-									clrprintf(Message.m_ColorPair, "%s", Message.m_pMessage);
-								}
-								ResetEvent(ol.hEvent);
-							}
-						}
-						Sleep(5);
-					}
-					break;
-				}
-				default: {
-					break;
-				}
-			}
-		} else {
-			Message.m_pMessage[sizeof(Message.m_pMessage) - 1] = '\0';
-			if (strnlen_s(Message.m_pMessage, sizeof(Message.m_pMessage)) > 0) {
-				clrprintf(Message.m_ColorPair, "%s", Message.m_pMessage);
-			}
-			bContinue = true;
-		}
-		Sleep(5);
-	}
-
-	tclrprintf(COLOR::COLOR_WHITE, _T("\n"));
-
-	CloseHandle(hEvent);
-	CloseHandle(hPipe);
 
 	return true;
 }
 
 int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
-
 	if (nArgsCount < 1) {
 		return -1;
 	}
 
-	Terminal T(true, true);
-	if (T.Open()) {
-		T.ChangeColorPalette(COLOR::COLOR_BLACK, 0x1B1B1B);
-		T.ChangeColorPalette(COLOR::COLOR_DARK_BLUE, 0x2962FF);
-		T.ChangeColorPalette(COLOR::COLOR_DARK_GREEN, 0x00C853);
-		T.ChangeColorPalette(COLOR::COLOR_DARK_CYAN, 0x00B8D4);
-		T.ChangeColorPalette(COLOR::COLOR_DARK_RED, 0xD50000);
-		T.ChangeColorPalette(COLOR::COLOR_DARK_MAGENTA, 0xAA00FF);
-		T.ChangeColorPalette(COLOR::COLOR_DARK_YELLOW, 0xFFD600);
-		T.ChangeColorPalette(COLOR::COLOR_DARK_GRAY, 0x616161);
-		T.ChangeColorPalette(COLOR::COLOR_GRAY, 0xEEEEEE);
-		T.ChangeColorPalette(COLOR::COLOR_BLUE, 0x448AFF);
-		T.ChangeColorPalette(COLOR::COLOR_GREEN, 0x69F0AE);
-		T.ChangeColorPalette(COLOR::COLOR_CYAN, 0x18FFFF);
-		T.ChangeColorPalette(COLOR::COLOR_RED, 0xFF5252);
-		T.ChangeColorPalette(COLOR::COLOR_MAGENTA, 0xE040FB);
-		T.ChangeColorPalette(COLOR::COLOR_YELLOW, 0xFFFF00);
-		T.ChangeColorPalette(COLOR::COLOR_WHITE, 0xFAFAFA);
+	Terminal::Window Window;
+	if (Window.Open()) {
+		Terminal::Screen Screen(&Window);
+		Terminal::Console Console(&Screen);
 
-		tclrprintf(COLOR::COLOR_WHITE, _T("OreansConsole [Version 1.0.1] (zeze839@gmail.com)\n\n"));
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_BLACK, 0x1B1B1B);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_DARK_BLUE, 0x2962FF);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_DARK_GREEN, 0x00C853);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_DARK_CYAN, 0x00B8D4);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_DARK_RED, 0xD50000);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_DARK_MAGENTA, 0xAA00FF);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_DARK_YELLOW, 0xFFD600);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_DARK_GRAY, 0x616161);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_GRAY, 0xEEEEEE);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_BLUE, 0x448AFF);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_GREEN, 0x69F0AE);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_CYAN, 0x18FFFF);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_RED, 0xFF5252);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_MAGENTA, 0xE040FB);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_YELLOW, 0xFFFF00);
+		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_WHITE, 0xFAFAFA);
+
+		Console.tprintf(Terminal::COLOR::COLOR_WHITE, _T("OreansConsole [Version 2.0.0]\n\n"));
 
 		TCHAR szMainFileName[16];
 		memset(szMainFileName, 0, sizeof(szMainFileName));
@@ -530,7 +444,7 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 		}
 
 		if (nArgsCount < 2) {
-			tclrprintf(COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|th|wl] <args>\n"), szMainFile);
+			Console.tprintf(Terminal::COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|th|wl] <args>\n"), szMainFile);
 			return 0;
 		}
 
@@ -543,17 +457,12 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 			}
 
 			if (_tcscmp(pArg, _T("/help")) == 0) {
-				tclrprintf(COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|th|wl] <args>\n  /cv - Code Virtualizer\n  /th - Themida\n  /wl - WinLicense\n  <args> - Passes arguments.\n"), szMainFile);
+				Console.tprintf(Terminal::COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|th|wl] <args>\n  /cv - Code Virtualizer\n  /th - Themida\n  /wl - WinLicense\n  <args> - Passes arguments.\n"), szMainFile);
 				return 0;
 			}
 
 			if (_tcscmp(pArg, _T("/cv")) == 0) {
 				unProductType = PRODUCT_TYPE::CODE_VIRTUALIZER;
-				continue;
-			}
-
-			if (_tcscmp(pArg, _T("/cv64")) == 0) {
-				unProductType = PRODUCT_TYPE::CODE_VIRTUALIZER64;
 				continue;
 			}
 
@@ -579,14 +488,14 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 		}
 
 		if (unProductType == PRODUCT_TYPE::UNKNOWN) {
-			//tclrprintf(COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|cv64|th|th64|wl|wl64] <args to parse in product>\n"), szMainFile);
-			tclrprintf(COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|cv64|th|th64|wl|wl64]\n"), szMainFile);
+			//Console.tprintf(Terminal::COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|cv64|th|th64|wl|wl64] <args to parse in product>\n"), szMainFile);
+			Console.tprintf(Terminal::COLOR::COLOR_YELLOW, _T("Usage: %s /[cv|cv64|th|th64|wl|wl64]\n"), szMainFile);
 			return -1;
 		}
 
 		HANDLE hToken = nullptr;
 		if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-			tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `OpenProcessToken` (LastError = 0x%08X)\n"), GetLastError());
+			Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `OpenProcessToken` (LastError = 0x%08X)\n"), GetLastError());
 			return -1;
 		}
 
@@ -595,7 +504,7 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 
 		if (!LookupPrivilegeValue(nullptr, SE_DEBUG_NAME, &luid)) {
 			CloseHandle(hToken);
-			tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `LookupPrivilegeValue` (LastError = 0x%08X)\n"), GetLastError());
+			Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `LookupPrivilegeValue` (LastError = 0x%08X)\n"), GetLastError());
 			return -1;
 		}
 
@@ -608,7 +517,7 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 
 		if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), nullptr, nullptr)) {
 			CloseHandle(hToken);
-			tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `AdjustTokenPrivileges` (LastError = 0x%08X)\n"), GetLastError());
+			Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `AdjustTokenPrivileges` (LastError = 0x%08X)\n"), GetLastError());
 			return -1;
 		}
 
@@ -624,63 +533,82 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 
 		if (unProductType == PRODUCT_TYPE::CODE_VIRTUALIZER) {
 			if (!CreateProcess(_T("Virtualizer.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
-				return -1;
-			}
-		}
-
-		if (unProductType == PRODUCT_TYPE::CODE_VIRTUALIZER64) {
-			if (!CreateProcess(_T("Virtualizer64.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
 				return -1;
 			}
 		}
 
 		if (unProductType == PRODUCT_TYPE::THEMIDA) {
 			if (!CreateProcess(_T("Themida.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
 				return -1;
 			}
 		}
 
 		if (unProductType == PRODUCT_TYPE::THEMIDA64) {
 			if (!CreateProcess(_T("Themida64.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
 				return -1;
 			}
 		}
 
 		if (unProductType == PRODUCT_TYPE::WINLICENSE) {
 			if (!CreateProcess(_T("WinLicense.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
 				return -1;
 			}
 		}
 
 		if (unProductType == PRODUCT_TYPE::WINLICENSE64) {
 			if (!CreateProcess(_T("WinLicense64.exe"), nullptr, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-				tclrprintf(COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
+				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed `CreateProcess` (LastError = 0x%08X)\n"), GetLastError());
 				return -1;
 			}
 		}
 
-		if (!HackProcess(pi.hProcess, pi.hThread)) {
+		Terminal::Server TerminalServer(&Screen);
+
+		if (!HackProcess(Console, TerminalServer, pi.hProcess, pi.hThread)) {
 			CloseHandle(pi.hThread);
 			TerminateProcess(pi.hProcess, 0);
 			CloseHandle(pi.hProcess);
 			return -1;
 		}
 
-		if (!ConnectToProcess()) {
+		if (!TerminalServer.Open()) {
 			CloseHandle(pi.hThread);
 			TerminateProcess(pi.hProcess, 0);
 			CloseHandle(pi.hProcess);
 			return -1;
 		}
+
+		auto MessagePtr = std::make_unique<Terminal::TerminalMessage>();
+		if (!MessagePtr) {
+			CloseHandle(pi.hThread);
+			TerminateProcess(pi.hProcess, 0);
+			CloseHandle(pi.hProcess);
+			return -1;
+		}
+
+		while (MessagePtr->GetAction() != Terminal::TERMINAL_MESSAGE_ACTION::ACTION_CLOSE) {
+			memset(MessagePtr.get(), 0, sizeof(Terminal::TerminalMessage));
+
+			if (!TerminalServer.Receive(MessagePtr)) {
+				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("RECEIVE ERROR!\n"));
+				break;
+			}
+
+			if (!TerminalServer.Process(MessagePtr)) {
+				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("PROCESS ERROR!\n"));
+				break;
+			}
+		}
+
+		TerminalServer.Close();
 
 		CloseHandle(pi.hThread);
 		CloseHandle(pi.hProcess);
-
 	}
+
 	return 0;
 }

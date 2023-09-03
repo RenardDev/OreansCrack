@@ -132,12 +132,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Console.cpp" />
-    <ClCompile Include="ConsoleUtils.cpp" />
     <ClCompile Include="Detours.cpp" />
+    <ClCompile Include="Terminal.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ConsoleUtils.h" />
     <ClInclude Include="Detours.h" />
+    <ClInclude Include="Terminal.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

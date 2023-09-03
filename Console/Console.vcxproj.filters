@@ -18,18 +18,18 @@
     <ClCompile Include="Console.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
-    <ClCompile Include="ConsoleUtils.cpp">
+    <ClCompile Include="Detours.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
-    <ClCompile Include="Detours.cpp">
+    <ClCompile Include="Terminal.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ConsoleUtils.h">
+    <ClInclude Include="Detours.h">
       <Filter>Файлы заголовков</Filter>
     </ClInclude>
-    <ClInclude Include="Detours.h">
+    <ClInclude Include="Terminal.h">
       <Filter>Файлы заголовков</Filter>
     </ClInclude>
   </ItemGroup>

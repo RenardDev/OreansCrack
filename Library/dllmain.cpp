@@ -2,8 +2,8 @@
 // Framework
 #include "framework.h"
 
-// ConsoleAPI
-#include "Console.h"
+// Terminal
+#include "Terminal.h"
 
 // LibraryLoader
 #include "LibraryLoader.h"
@@ -11,9 +11,8 @@
 // Detours
 #include "Detours.h"
 
-// Distorm(X)
-#include "distorm.h"
-#include "distormx.h"
+// HookManager
+#include "HookManager.h"
 
 // STL
 #include <unordered_map>
@@ -21,20 +20,46 @@
 #include <vector>
 #include <array>
 
-// Namespaces
-using namespace Detours;
-
 #pragma comment(lib, "dbghelp.lib")
 
+// ----------------------------------------------------------------
 // General definitions
-typedef LRESULT(WINAPI* fnSendMessageW)(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam);
-typedef BOOL(WINAPI* fnVirtualProtect)(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect);
-typedef HANDLE(WINAPI* fnCreateRemoteThreadEx)(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, LPDWORD lpThreadId);
+// ----------------------------------------------------------------
+
 typedef void(__stdcall* fnVM)(unsigned char, unsigned int*);
-typedef HANDLE(WINAPI* fnCreateFileW)(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+
+Terminal::Client TerminalClient;
+
+DECLARE_INLINE_HOOK(
+	CreateFileW,
+	HANDLE,
+	WINAPI,
+	LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile
+);
+
+DECLARE_INLINE_HOOK(
+	SendMessageW,
+	LRESULT,
+	WINAPI,
+	HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam
+);
+
+DECLARE_INLINE_HOOK(
+	VirtualProtect,
+	BOOL,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect
+);
+
+DECLARE_INLINE_HOOK(
+	CreateRemoteThreadEx,
+	HANDLE,
+	WINAPI,
+	HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, LPDWORD lpThreadId
+);
 
 bool SuspendOtherThreads() {
-	const PTEB pTEB = GetTEB();
+	auto pTEB = Detours::GetTEB();
 	if (!pTEB) {
 		return false;
 	}
@@ -81,7 +106,7 @@ bool SuspendOtherThreads() {
 }
 
 void ResumeOtherThreads() {
-	const PTEB pTEB = GetTEB();
+	auto pTEB = Detours::GetTEB();
 	if (!pTEB) {
 		return;
 	}
@@ -161,58 +186,90 @@ bool GetCalls(void** pBuffer, size_t* pMaxCount) {
 PLOADER_DATA g_pLoaderData = nullptr;
 HMODULE g_pSelf = nullptr;
 
-fnCreateFileW CreateFileW_Original = nullptr;
-HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
-	//clrprintf(COLOR::COLOR_RED, "[+] CreateFileW_Hook(\"%ws\", ...) called from 0x%08X (RVA: 0x%08X)\n", lpFileName, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+DEFINE_INLINE_HOOK(
+	CreateFileW, {
+		HMODULE hKernel32 = GetModuleHandle(_T("kernel32.dll"));
+		if (!hKernel32) {
+			return nullptr;
+		}
+
+		return GetProcAddress(hKernel32, "CreateFileW");
+	},
+	HANDLE,
+	WINAPI,
+	LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile
+) {
+	//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] CreateFileW_Hook(\"%ws\", ...) called from 0x%08X (RVA: 0x%08X)\n", lpFileName, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
 	//void* pCalls[256];
 	//memset(pCalls, 0, sizeof(pCalls));
 	//size_t unMax = 256;
 	//GetCalls(pCalls, &unMax);
 
 	//for (unsigned int i = 0; i < unMax; ++i) {
-	//	clrprintf(COLOR::COLOR_RED, "[+]  Trace: 0x%08X (RVA: 0x%08X)\n", (unsigned int)pCalls[i], (unsigned int)pCalls[i] - (unsigned int)g_pSelf);
+	//	TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+]  Trace: 0x%08X (RVA: 0x%08X)\n", (unsigned int)pCalls[i], (unsigned int)pCalls[i] - (unsigned int)g_pSelf);
 	//}
 
-	return CreateFileW_Original(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+	return g_HookCreateFileW.Call(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 }
 
-fnSendMessageW SendMessageW_Original = nullptr;
-LRESULT WINAPI SendMessageW_Hook(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+DEFINE_INLINE_HOOK(
+	SendMessageW, {
+		HMODULE hUser32 = GetModuleHandle(_T("user32.dll"));
+		if (!hUser32) {
+			return nullptr;
+		}
+
+		return GetProcAddress(hUser32, "SendMessageW");
+	},
+	LRESULT,
+	WINAPI,
+	HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam
+) {
 	switch (Msg) {
 		case 0x14: { // Mouse
-			return SendMessageW_Original(hWnd, Msg, wParam, lParam);
+			return g_HookSendMessageW.Call(hWnd, Msg, wParam, lParam);
 		}
 		case 0x281: { // Window
-			return SendMessageW_Original(hWnd, Msg, wParam, lParam);
+			return g_HookSendMessageW.Call(hWnd, Msg, wParam, lParam);
 		}
 		case 0x282: { // Window
-			return SendMessageW_Original(hWnd, Msg, wParam, lParam);
+			return g_HookSendMessageW.Call(hWnd, Msg, wParam, lParam);
 		}
 		case 0x288: { // Window
-			return SendMessageW_Original(hWnd, Msg, wParam, lParam);
+			return g_HookSendMessageW.Call(hWnd, Msg, wParam, lParam);
 		}
 		case 0x317: { // Mouse
-			return SendMessageW_Original(hWnd, Msg, wParam, lParam);
+			return g_HookSendMessageW.Call(hWnd, Msg, wParam, lParam);
 		}
 		case 0x318: { // Mouse
-			return SendMessageW_Original(hWnd, Msg, wParam, lParam);
+			return g_HookSendMessageW.Call(hWnd, Msg, wParam, lParam);
 		}
 	}
 	/*
 	if ((Msg >= 0x0000) && (Msg <= 0x03FF) && wParam && lParam) {
-		clrprintf(COLOR::COLOR_RED, "[+] SendMessageW_Hook(0x%08X, 0x%08X, 0x%08X, 0x%08X) from 0x%08X (0x%08X)\n", (UINT)hWnd, Msg, (UINT)wParam, (UINT)lParam, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] SendMessageW_Hook(0x%08X, 0x%08X, 0x%08X, 0x%08X) from 0x%08X (0x%08X)\n", (UINT)hWnd, Msg, (UINT)wParam, (UINT)lParam, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
 	}
 	if ((Msg >= 0x8000) && (Msg <= 0xBFFF) && wParam && lParam) {
-		clrprintf(COLOR::COLOR_RED, "[+] SendMessageW_Hook(0x%08X, 0x%08X, 0x%08X, 0x%08X) from 0x%08X (0x%08X)\n", (UINT)hWnd, Msg, (UINT)wParam, (UINT)lParam, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] SendMessageW_Hook(0x%08X, 0x%08X, 0x%08X, 0x%08X) from 0x%08X (0x%08X)\n", (UINT)hWnd, Msg, (UINT)wParam, (UINT)lParam, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
 	}
 	if ((Msg >= 0xC000) && (Msg <= 0xFFFF) && wParam && lParam) {
-		clrprintf(COLOR::COLOR_RED, "[+] SendMessageW_Hook(0x%08X, 0x%08X, 0x%08X, 0x%08X) from 0x%08X (0x%08X)\n", (UINT)hWnd, Msg, (UINT)wParam, (UINT)lParam, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] SendMessageW_Hook(0x%08X, 0x%08X, 0x%08X, 0x%08X) from 0x%08X (0x%08X)\n", (UINT)hWnd, Msg, (UINT)wParam, (UINT)lParam, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
 	}
 	*/
-	return SendMessageW_Original(hWnd, Msg, wParam, lParam);
+	return g_HookSendMessageW.Call(hWnd, Msg, wParam, lParam);
 }
 
 bool bMonitorMemory = false;
+
+Detours::Hook::RawHook RawVMHook;
+bool __cdecl VMHook(Detours::Hook::PRAW_HOOK_CONTEXT pCTX) {
+	TerminalClient.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[+] VM call!\n"));
+
+	pCTX->m_unESP -= 4;
+	*reinterpret_cast<unsigned int*>(pCTX->m_unESP) = reinterpret_cast<unsigned int>(RawVMHook.GetTrampoline());
+
+	return true;
+}
 
 fnVM pVM = nullptr;
 void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
@@ -501,8 +558,8 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 				default: {
 					pVM(unIndex, pData);
 
-					clrprintf(COLOR::COLOR_RED, "[+] CallMacro (ID=0x%02X)\n", unMacroIndex);
-					clrprintf(COLOR::COLOR_RED, "[+]  Data: %08X (%08X)\n", pMacroResult, *pMacroResult);
+					//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] CallMacro (ID=0x%02X)\n", unMacroIndex);
+					//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+]  Data: %08X (%08X)\n", pMacroResult, *pMacroResult);
 
 					return;
 				}
@@ -573,12 +630,12 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 		default: {
 			pVM(unIndex, pData);
 
-			clrprintf(COLOR::COLOR_RED, "[+] CallVM (ID=0x%02X) from 0x%08X (RVA: 0x%08X)\n", unIndex, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
-			clrprintf(COLOR::COLOR_RED, "[+]  Data: ");
-			for (unsigned char i = 0; i < 14; ++i) {
-				clrprintf(COLOR::COLOR_RED, "%08X ", pData[i]);
-			}
-			clrprintf(COLOR::COLOR_RED, "\n");
+			//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] CallVM (ID=0x%02X) from 0x%08X (RVA: 0x%08X)\n", unIndex, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+			//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+]  Data: ");
+			//for (unsigned char i = 0; i < 14; ++i) {
+//				TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "%08X ", pData[i]);
+	//		}
+	//		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "\n");
 
 			return;
 		}
@@ -586,20 +643,42 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 	return;
 }
 
-fnVirtualProtect VirtualProtect_Original = nullptr;
-BOOL WINAPI VirtualProtect_Hook(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect) {
-	BOOL bRes = VirtualProtect_Original(lpAddress, dwSize, flNewProtect, lpflOldProtect);
+DEFINE_INLINE_HOOK(
+	VirtualProtect, {
+		HMODULE hKernel32 = GetModuleHandle(_T("kernel32.dll"));
+		if (!hKernel32) {
+			return nullptr;
+		}
+
+		return GetProcAddress(hKernel32, "VirtualProtect");
+	},
+	BOOL,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect
+) {
+	BOOL bRes = g_HookVirtualProtect.Call(lpAddress, dwSize, flNewProtect, lpflOldProtect);
 	//if (bMonitorMemory && (dwSize > 0x1000)) {
-	//	clrprintf(COLOR::COLOR_RED, "[+] Memory protected! (lpAddress=0x%08X, dwSize=0x%08X, flNewProtect=0x%08X)\n", reinterpret_cast<DWORD>(lpAddress), dwSize, flNewProtect);
+	//	TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] Memory protected! (lpAddress=0x%08X, dwSize=0x%08X, flNewProtect=0x%08X)\n", reinterpret_cast<DWORD>(lpAddress), dwSize, flNewProtect);
 	//}
 	return bRes;
 }
 
 bool bOnce = false;
 bool bOnceDump = false;
-fnCreateRemoteThreadEx CreateRemoteThreadEx_Original = nullptr;
-HANDLE WINAPI CreateRemoteThreadEx_Hook(HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, LPDWORD lpThreadId) {
 
+DEFINE_INLINE_HOOK(
+	CreateRemoteThreadEx, {
+		HMODULE hKernel32 = GetModuleHandle(_T("kernel32.dll"));
+		if (!hKernel32) {
+			return nullptr;
+		}
+
+		return GetProcAddress(hKernel32, "CreateRemoteThreadEx");
+	},
+	HANDLE,
+	WINAPI,
+	HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, LPDWORD lpThreadId
+) {
 	/*
 	if (!bOnceDump) {
 		bOnceDump = true;
@@ -616,34 +695,37 @@ HANDLE WINAPI CreateRemoteThreadEx_Hook(HANDLE hProcess, LPSECURITY_ATTRIBUTES l
 				fwrite(reinterpret_cast<void*>(0x10000000), 1, pOH->SizeOfImage - 1, pFile);
 				ResumeOtherThreads();
 				fclose(pFile);
-				clrprintf(COLOR::COLOR_BLUE, "[+] SecureEngine dumped!\n");
+				TerminalClient.tprintf(Terminal::COLOR::COLOR_BLUE, "[+] SecureEngine dumped!\n");
 			}
 		}
 	}
 	*/
 
-	void* pIsDemo = const_cast<void*>(Scan::FindSignature(g_pSelf, "\x55\x8B\xEC\x81\xC4\xBC\xFD\xFF\xFF\x8D")); // 55 8B EC 81 C4 BC FD FF FF 8D
+	void* pIsDemo = const_cast<void*>(Detours::Scan::FindSignature(g_pSelf, "\x55\x8B\xEC\x81\xC4\xBC\xFD\xFF\xFF\x8D")); // 55 8B EC 81 C4 BC FD FF FF 8D
 	if (pIsDemo && !bOnce) {
 		bOnce = true;
 		unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
-		Memory::ChangeProtection(pMOV, 1, PAGE_READWRITE);
+		Detours::Memory::Protection Patch(pMOV, 1, false);
+		Patch.ChangeProtection(PAGE_READWRITE);
 		pMOV[0] = 0;
-		Memory::RestoreProtection(pMOV);
+		Patch.RestoreProtection();
 
 		unsigned char* pCallVM = reinterpret_cast<unsigned char*>(pIsDemo) + 0x10;
 		pVM = reinterpret_cast<fnVM>(reinterpret_cast<unsigned int>(pCallVM) + sizeof(unsigned int) + (*reinterpret_cast<unsigned int*>(pCallVM)));
 
 		if (reinterpret_cast<unsigned char*>(pVM)[0] == 0xFF) {
-			distormx_hook((void**)&pVM, VM_Hook);
-			clrprintf(COLOR::COLOR_BLUE, "[+] Hooked VM call!\n");
+			RawVMHook.Set(pVM);
+			RawVMHook.Hook(VMHook);
+			TerminalClient.tprintf(Terminal::COLOR::COLOR_BLUE, _T("[+] Hooked VM call!\n"));
 		}
 	}
 
-	HANDLE hThread = CreateRemoteThreadEx_Original(hProcess, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, (dwCreationFlags & CREATE_SUSPENDED) ? dwCreationFlags : (dwCreationFlags | CREATE_SUSPENDED), lpAttributeList, lpThreadId);
-	clrprintf(COLOR::COLOR_CYAN, "[+] Thread created! (ID=%lu) (lpStartAddress=0x%08X, lpParameter=0x%08X) from 0x%08X (RVA: 0x%08X)\n", GetThreadId(hThread), reinterpret_cast<DWORD>(lpStartAddress), reinterpret_cast<DWORD>(lpParameter), (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+	HANDLE hThread = g_HookCreateRemoteThreadEx.Call(hProcess, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, (dwCreationFlags & CREATE_SUSPENDED) ? dwCreationFlags : (dwCreationFlags | CREATE_SUSPENDED), lpAttributeList, lpThreadId);
+	TerminalClient.tprintf(Terminal::COLOR::COLOR_CYAN, _T("[+] Thread created! (ID=%lu) (lpStartAddress=0x%08X, lpParameter=0x%08X) from 0x%08X (RVA: 0x%08X)\n"), GetThreadId(hThread), reinterpret_cast<DWORD>(lpStartAddress), reinterpret_cast<DWORD>(lpParameter), (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
 	if (!(dwCreationFlags & CREATE_SUSPENDED)) {
 		ResumeThread(hThread);
 	}
+
 	return hThread;
 }
 
@@ -681,78 +763,21 @@ DWORD WINAPI MainRoutine(LPVOID lpThreadParameter) {
 		return 0;
 	}
 
-	if (!ConnectToConsole()) {
+	if (!TerminalClient.Open(g_pLoaderData->m_pSessionName)) {
 		return 0;
 	}
 
 	g_pSelf = GetModuleHandle(nullptr);
 
-	clrprintf(COLOR::COLOR_WHITE, "OreansCrack [Version 1.0.1] (zeze839@gmail.com)\n\n");
-	clrprintf(COLOR::COLOR_WHITE, "[OreansCrack] Loading... ");
+	TerminalClient.tprintf(Terminal::COLOR::COLOR_WHITE, _T("OreansCrack [Version 2.0.0]\n\n"));
+	TerminalClient.tprintf(Terminal::COLOR::COLOR_WHITE, _T("[OreansCrack] Loading... "));
 
-	HMODULE hNTDLL = GetModuleHandle(_T("ntdll.dll"));
-	if (!hNTDLL) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
+	if (!g_HookManager.HookAll()) {
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[ FAIL ]\n"));
 		return 0;
 	}
 
-	HMODULE hKernel32 = GetModuleHandle(_T("kernel32.dll"));
-	if (!hKernel32) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	HMODULE hUser32 = GetModuleHandle(_T("user32.dll"));
-	if (!hUser32) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	VirtualProtect_Original = reinterpret_cast<fnVirtualProtect>(GetProcAddress(hKernel32, "VirtualProtect"));
-	if (!VirtualProtect_Original) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	if (!distormx_hook(reinterpret_cast<void**>(&VirtualProtect_Original), VirtualProtect_Hook)) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	CreateRemoteThreadEx_Original = reinterpret_cast<fnCreateRemoteThreadEx>(GetProcAddress(hKernel32, "CreateRemoteThreadEx"));
-	if (!CreateRemoteThreadEx_Original) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	if (!distormx_hook(reinterpret_cast<void**>(&CreateRemoteThreadEx_Original), CreateRemoteThreadEx_Hook)) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	CreateFileW_Original = reinterpret_cast<fnCreateFileW>(GetProcAddress(hKernel32, "CreateFileW"));
-	if (!CreateFileW_Original) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	if (!distormx_hook(reinterpret_cast<void**>(&CreateFileW_Original), CreateFileW_Hook)) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	SendMessageW_Original = reinterpret_cast<fnSendMessageW>(GetProcAddress(hUser32, "SendMessageW"));
-	if (!SendMessageW_Original) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	if (!distormx_hook(reinterpret_cast<void**>(&SendMessageW_Original), SendMessageW_Hook)) {
-		clrprintf(COLOR::COLOR_RED, "[ FAIL ]\n");
-		return 0;
-	}
-
-	clrprintf(COLOR::COLOR_GREEN, "[  OK  ]\n");
+	TerminalClient.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[  OK  ]\n"));
 
 	bMonitorMemory = true;
 

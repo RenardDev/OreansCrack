@@ -147,39 +147,18 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="Console.cpp" />
     <ClCompile Include="Detours.cpp" />
-    <ClCompile Include="distormx\src\distormx.c" />
-    <ClCompile Include="distormx\src\OS.c" />
-    <ClCompile Include="distorm\src\decoder.c" />
-    <ClCompile Include="distorm\src\distorm.c" />
-    <ClCompile Include="distorm\src\instructions.c" />
-    <ClCompile Include="distorm\src\insts.c" />
-    <ClCompile Include="distorm\src\mnemonics.c" />
-    <ClCompile Include="distorm\src\operands.c" />
-    <ClCompile Include="distorm\src\prefix.c" />
-    <ClCompile Include="distorm\src\textdefs.c" />
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="HookManager.cpp" />
     <ClCompile Include="LibraryLoader.cpp" />
+    <ClCompile Include="Terminal.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Console.h" />
     <ClInclude Include="Detours.h" />
-    <ClInclude Include="distormx\include\distormx.h" />
-    <ClInclude Include="distormx\src\OS.h" />
-    <ClInclude Include="distorm\include\distorm.h" />
-    <ClInclude Include="distorm\include\mnemonics.h" />
-    <ClInclude Include="distorm\src\config.h" />
-    <ClInclude Include="distorm\src\decoder.h" />
-    <ClInclude Include="distorm\src\instructions.h" />
-    <ClInclude Include="distorm\src\insts.h" />
-    <ClInclude Include="distorm\src\operands.h" />
-    <ClInclude Include="distorm\src\prefix.h" />
-    <ClInclude Include="distorm\src\textdefs.h" />
-    <ClInclude Include="distorm\src\wstring.h" />
-    <ClInclude Include="distorm\src\x86defs.h" />
     <ClInclude Include="framework.h" />
+    <ClInclude Include="HookManager.h" />
     <ClInclude Include="LibraryLoader.h" />
+    <ClInclude Include="Terminal.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
