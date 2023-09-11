@@ -606,15 +606,19 @@
 #endif // !HOOK_STORAGE_CAPACITY
 
 #ifndef HOOK_INLINE_TRAMPOLINE_SIZE
-#define HOOK_INLINE_TRAMPOLINE_SIZE 45 // Reserving the trampoline for 3 instructions - Max instruction size is 15 bytes.
+#define HOOK_INLINE_TRAMPOLINE_SIZE 15 // Max trampoline size.
 #endif // !HOOK_INLINE_TRAMPOLINE_SIZE
 
 #ifndef HOOK_RAW_WRAPPER_SIZE
-#define HOOK_RAW_WRAPPER_SIZE 0x800 // Max wrapper size.
+#ifdef _M_X64
+#define HOOK_RAW_WRAPPER_SIZE 0x500 // Max wrapper size.
+#elif _M_IX86
+#define HOOK_RAW_WRAPPER_SIZE 0x300 // Max wrapper size.
+#endif
 #endif // !HOOK_RAW_WRAPPER_SIZE
 
 #ifndef HOOK_RAW_TRAMPOLINE_SIZE
-#define HOOK_RAW_TRAMPOLINE_SIZE 45 // Reserving the trampoline for 3 instructions - Max instruction size is 15 bytes.
+#define HOOK_RAW_TRAMPOLINE_SIZE 15 // Max trampoline size.
 #endif // !HOOK_RAW_TRAMPOLINE_SIZE
 
 // ----------------------------------------------------------------
@@ -1705,13 +1709,16 @@ namespace Detours {
 
 			void* Alloc(size_t unSize);
 			bool DeAlloc(void* pAddress);
-			bool DeAllocAll();
+			void DeAllocAll();
 
 		public:
 			void* GetAddress() const;
 			size_t GetCapacity() const;
 			size_t GetSize() const;
 			bool IsEmpty() const;
+
+		private:
+			void MergeFreeBlocks();
 
 		private:
 			struct Block {
@@ -1745,13 +1752,16 @@ namespace Detours {
 
 			void* Alloc(size_t unSize);
 			bool DeAlloc(void* pAddress);
-			bool DeAllocAll();
+			void DeAllocAll();
 
 		public:
 			void* GetAddress() const;
 			size_t GetCapacity() const;
 			size_t GetSize() const;
 			bool IsEmpty() const;
+
+		private:
+			void MergeFreeBlocks();
 
 		private:
 			struct Block {
@@ -5221,12 +5231,6 @@ namespace Detours {
 			};
 
 			// ----------------------------------------------------------------
-			// FPU
-			// ----------------------------------------------------------------
-
-			RAW_HOOK_FPU m_FPU;
-
-			// ----------------------------------------------------------------
 			// Registers (MMX)
 			// ----------------------------------------------------------------
 
@@ -5290,6 +5294,12 @@ namespace Detours {
 				RAW_HOOK_M256 m_YMM7;
 				RAW_HOOK_M128 m_XMM7;
 			};
+
+			// ----------------------------------------------------------------
+			// FPU
+			// ----------------------------------------------------------------
+
+			RAW_HOOK_FPU m_FPU;
 		} RAW_HOOK_CONTEXT32, *PRAW_HOOK_CONTEXT32;
 
 		typedef struct _RAW_HOOK_CONTEXT64 {
@@ -5485,12 +5495,6 @@ namespace Detours {
 				unsigned short m_unR15W;
 				unsigned char m_unR15B;
 			};
-
-			// ----------------------------------------------------------------
-			// FPU
-			// ----------------------------------------------------------------
-
-			RAW_HOOK_FPU m_FPU;
 
 			// ----------------------------------------------------------------
 			// Registers (MMX)
@@ -5700,6 +5704,12 @@ namespace Detours {
 				RAW_HOOK_M256 m_YMM31;
 				RAW_HOOK_M128 m_XMM31;
 			};
+
+			// ----------------------------------------------------------------
+			// FPU
+			// ----------------------------------------------------------------
+
+			RAW_HOOK_FPU m_FPU;
 		} RAW_HOOK_CONTEXT64, *PRAW_HOOK_CONTEXT64;
 
 #ifdef _M_X64
