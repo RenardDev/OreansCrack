@@ -262,7 +262,7 @@ DEFINE_INLINE_HOOK(
 bool bMonitorMemory = false;
 
 Detours::Hook::RawHook RawVMHook;
-bool __cdecl VMHook(Detours::Hook::PRAW_HOOK_CONTEXT pCTX) {
+bool __cdecl VMHook(Detours::Hook::PRAW_CONTEXT pCTX) {
 	TerminalClient.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[+] VM call!\n"));
 
 	pCTX->m_unESP -= 4;
@@ -706,7 +706,7 @@ DEFINE_INLINE_HOOK(
 		bOnce = true;
 		unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
 		Detours::Memory::Protection Patch(pMOV, 1, false);
-		Patch.ChangeProtection(PAGE_READWRITE);
+		Patch.ChangeProtection(PAGE_EXECUTE_READWRITE);
 		pMOV[0] = 0;
 		Patch.RestoreProtection();
 
@@ -715,12 +715,12 @@ DEFINE_INLINE_HOOK(
 
 		if (reinterpret_cast<unsigned char*>(pVM)[0] == 0xFF) {
 			RawVMHook.Set(pVM);
-			RawVMHook.Hook(VMHook);
+			RawVMHook.Hook(VMHook, true);
 			TerminalClient.tprintf(Terminal::COLOR::COLOR_BLUE, _T("[+] Hooked VM call!\n"));
 		}
 	}
 
-	HANDLE hThread = g_HookCreateRemoteThreadEx.Call(hProcess, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, (dwCreationFlags & CREATE_SUSPENDED) ? dwCreationFlags : (dwCreationFlags | CREATE_SUSPENDED), lpAttributeList, lpThreadId);
+	HANDLE hThread = g_HookCreateRemoteThreadEx.Call(hProcess, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, lpAttributeList, lpThreadId);
 	TerminalClient.tprintf(Terminal::COLOR::COLOR_CYAN, _T("[+] Thread created! (ID=%lu) (lpStartAddress=0x%08X, lpParameter=0x%08X) from 0x%08X (RVA: 0x%08X)\n"), GetThreadId(hThread), reinterpret_cast<DWORD>(lpStartAddress), reinterpret_cast<DWORD>(lpParameter), (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
 	if (!(dwCreationFlags & CREATE_SUSPENDED)) {
 		ResumeThread(hThread);
@@ -789,7 +789,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 	g_pLoaderData = reinterpret_cast<PLOADER_DATA>(lpReserved);
 	switch (ul_reason_for_call) {
 		case DLL_PROCESS_ATTACH: {
-			CreateThread(nullptr, 0x100000 /* 1 MiB */, MainRoutine, lpReserved, NULL, nullptr);
+			CreateThread(nullptr, NULL, MainRoutine, lpReserved, NULL, nullptr);
 		}
 		case DLL_THREAD_ATTACH: {
 			break;

@@ -35,18 +35,18 @@ namespace Terminal {
 	typedef struct _WINDOW_NATIVE_IO {
 		HANDLE m_hIN;
 		HANDLE m_hOUT;
-	} WINDOW_NATIVE_IO, *PWINDOW_NATIVE_IO;
+	} WINDOW_NATIVE_IO, * PWINDOW_NATIVE_IO;
 
 	typedef struct _WINDOW_IO {
 		FILE* m_pIN;
 		FILE* m_pOUT;
-	} WINDOW_IO, *PWINDOW_IO;
+	} WINDOW_IO, * PWINDOW_IO;
 
 	typedef struct _WINDOW_DATA {
 		DWORD m_unMode;
 		LONG m_nStyle;
 		LONG m_nStyleEx;
-	} WINDOW_DATA, *PWINDOW_DATA;
+	} WINDOW_DATA, * PWINDOW_DATA;
 
 	class Window {
 	public:
@@ -94,7 +94,7 @@ namespace Terminal {
 		COLOR_YELLOW = FOREGROUND_INTENSITY | FOREGROUND_RED | FOREGROUND_GREEN,
 		COLOR_WHITE = FOREGROUND_INTENSITY | FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
 		COLOR_AUTO = 0xFF
-	} COLOR, *PCOLOR;
+	} COLOR, * PCOLOR;
 
 	typedef struct _COLOR_PAIR {
 	public:
@@ -116,7 +116,7 @@ namespace Terminal {
 	public:
 		COLOR m_unBackground;
 		COLOR m_unForeground;
-	} COLOR_PAIR, *PCOLOR_PAIR;
+	} COLOR_PAIR, * PCOLOR_PAIR;
 
 	class Screen {
 	public:
@@ -294,7 +294,7 @@ namespace Terminal {
 		ACTION_SETCURSORINFO,
 		ACTION_SETCURSORPOSITION,
 		ACTION_ERASE
-	} TERMINAL_MESSAGE_ACTION, *PTERMINAL_MESSAGE_ACTION;
+	} TERMINAL_MESSAGE_ACTION, * PTERMINAL_MESSAGE_ACTION;
 
 	class TerminalMessage {
 	public:
@@ -329,14 +329,15 @@ namespace Terminal {
 	public:
 		bool Open();
 		bool Close();
+		bool Launch();
+
+	private:
 		bool Send(const std::unique_ptr<TerminalMessage>& ptrMessage);
 		bool Receive(const std::unique_ptr<TerminalMessage>& ptrMessage);
 		bool Process(const std::unique_ptr<TerminalMessage>& ptrMessage);
 
 	public:
 		Screen* const GetScreen() const;
-
-	public:
 		bool GetSessionName(TCHAR szSessionName[64]);
 		const HANDLE GetPipe() const;
 
@@ -358,8 +359,6 @@ namespace Terminal {
 	public:
 		bool Open(TCHAR szSessionName[64]);
 		bool Close();
-		bool Send(const std::unique_ptr<TerminalMessage>& ptrMessage);
-		bool Receive(const std::unique_ptr<TerminalMessage>& ptrMessage);
 
 	public:
 		bool ReadA(char* const szBuffer, const unsigned int unLength);
@@ -474,6 +473,10 @@ namespace Terminal {
 		int tscanf(const COLOR_PAIR& ColorPair, char const* const _Format, ...);
 		int tscanf(const COLOR& unForegroundColor, char const* const _Format, ...);
 #endif
+
+	private:
+		bool Send(const std::unique_ptr<TerminalMessage>& ptrMessage);
+		bool Receive(const std::unique_ptr<TerminalMessage>& ptrMessage);
 
 	public:
 		bool GetSessionName(TCHAR szSessionName[64]);

@@ -606,7 +606,7 @@
 #endif // !HOOK_STORAGE_CAPACITY
 
 #ifndef HOOK_INLINE_TRAMPOLINE_SIZE
-#define HOOK_INLINE_TRAMPOLINE_SIZE 15 // Max trampoline size.
+#define HOOK_INLINE_TRAMPOLINE_SIZE 45 // Max trampoline size.
 #endif // !HOOK_INLINE_TRAMPOLINE_SIZE
 
 #ifndef HOOK_RAW_WRAPPER_SIZE
@@ -618,7 +618,7 @@
 #endif // !HOOK_RAW_WRAPPER_SIZE
 
 #ifndef HOOK_RAW_TRAMPOLINE_SIZE
-#define HOOK_RAW_TRAMPOLINE_SIZE 15 // Max trampoline size.
+#define HOOK_RAW_TRAMPOLINE_SIZE 45 // Max trampoline size.
 #endif // !HOOK_RAW_TRAMPOLINE_SIZE
 
 // ----------------------------------------------------------------
@@ -5029,7 +5029,7 @@ namespace Detours {
 		};
 
 		// ----------------------------------------------------------------
-		// RAW_HOOK_CONTEXT
+		// RAW_CONTEXT
 		// ----------------------------------------------------------------
 
 #pragma pack(push, r1, 1)
@@ -5041,9 +5041,43 @@ namespace Detours {
 		} RAW_HOOK_FPU_REGISTER, *PRAW_HOOK_FPU_REGISTER;
 
 		typedef struct _RAW_HOOK_FPU {
-			unsigned short m_unControlWord;
+			union {
+				unsigned short m_unControlWord;
+				struct {
+					unsigned int m_unInvalidOperation : 1;
+					unsigned int m_unDenormalizedOperand : 1;
+					unsigned int m_unDivideByZero : 1;
+					unsigned int m_unOverflow : 1;
+					unsigned int m_unUnderflow : 1;
+					unsigned int m_unPrecision : 1;
+					unsigned int m_unReserved6 : 1;
+					unsigned int m_unReserved7 : 1;
+					unsigned int m_unPrecisionControl0 : 1;
+					unsigned int m_unPrecisionControl1 : 1;
+					unsigned int m_unRoundingControl0 : 1;
+					unsigned int m_unRoundingControl1 : 1;
+					unsigned int m_unInfinityControl : 1;
+				} ControlWord;
+			};
 			unsigned short m_unReserved1;
-			unsigned short m_unStatusWord;
+			union {
+				unsigned short m_unStatusWord;
+				struct {
+					unsigned int m_unInvalidOperation : 1;
+					unsigned int m_unDenormalizedOperand : 1;
+					unsigned int m_unDivideByZero : 1;
+					unsigned int m_unOverflow : 1;
+					unsigned int m_unUnderflow : 1;
+					unsigned int m_unPrecision : 1;
+					unsigned int m_unStackFault : 1;
+					unsigned int m_unExceptionSummary : 1;
+					unsigned int m_unCondition0 : 1;
+					unsigned int m_unCondition1 : 1;
+					unsigned int m_unCondition2 : 1;
+					unsigned int m_unCondition3 : 1;
+					unsigned int m_unFPUBusy : 1;
+				} StatusWord;
+			};
 			unsigned short m_unReserved2;
 			unsigned short m_unTagWord;
 			unsigned short m_unReserved3;
@@ -5055,19 +5089,6 @@ namespace Detours {
 			unsigned short m_unReserved4;
 			RAW_HOOK_FPU_REGISTER m_Registers[8];
 		} RAW_HOOK_FPU, *PRAW_HOOK_FPU;
-
-		typedef union _RAW_HOOK_M64 {
-			unsigned long long m_un64;
-			unsigned int m_un32[2];
-			unsigned short m_un16[4];
-			unsigned char m_un8[8];
-			long long m_n64;
-			int m_n32[2];
-			short m_n16[4];
-			char m_n8[8];
-			double m_f64;
-			float m_f32[2];
-		} RAW_HOOK_M64, *PRAW_HOOK_M64;
 
 		typedef union _RAW_HOOK_M128 {
 			unsigned long long m_un64[2];
@@ -5110,7 +5131,7 @@ namespace Detours {
 
 #pragma pack(pop, r1)
 
-		typedef struct _RAW_HOOK_CONTEXT32 {
+		typedef struct _RAW_NATIVE_CONTEXT32 {
 
 			// ----------------------------------------------------------------
 			// Flags
@@ -5120,43 +5141,32 @@ namespace Detours {
 				unsigned int m_unEFLAGS;
 				unsigned short m_unFLAGS;
 				struct {
-					unsigned int m_unCF   : 1;  // Bit 0: Carry Flag
-					unsigned int          : 1;  // Bit 1: Reserved
-					unsigned int m_unPF   : 1;  // Bit 2: Parity Flag
-					unsigned int          : 1;  // Bit 3: Reserved
-					unsigned int m_unAF   : 1;  // Bit 4: Auxiliary Carry Flag
-					unsigned int          : 1;  // Bit 5: Reserved
-					unsigned int m_unZF   : 1;  // Bit 6: Zero Flag
-					unsigned int m_unSF   : 1;  // Bit 7: Sign Flag
-					unsigned int m_unTF   : 1;  // Bit 8: Trap Flag
-					unsigned int m_unIF   : 1;  // Bit 9: Interrupt Enable Flag
-					unsigned int m_unDF   : 1;  // Bit 10: Direction Flag
-					unsigned int m_unOF   : 1;  // Bit 11: Overflow Flag
+					unsigned int m_unCF : 1;  // Bit 0: Carry Flag
+					unsigned int : 1;  // Bit 1: Reserved
+					unsigned int m_unPF : 1;  // Bit 2: Parity Flag
+					unsigned int : 1;  // Bit 3: Reserved
+					unsigned int m_unAF : 1;  // Bit 4: Auxiliary Carry Flag
+					unsigned int : 1;  // Bit 5: Reserved
+					unsigned int m_unZF : 1;  // Bit 6: Zero Flag
+					unsigned int m_unSF : 1;  // Bit 7: Sign Flag
+					unsigned int m_unTF : 1;  // Bit 8: Trap Flag
+					unsigned int m_unIF : 1;  // Bit 9: Interrupt Enable Flag
+					unsigned int m_unDF : 1;  // Bit 10: Direction Flag
+					unsigned int m_unOF : 1;  // Bit 11: Overflow Flag
 					unsigned int m_unIOPL : 2;  // Bit 12-13: I/O Privilege Level
-					unsigned int m_unNT   : 1;  // Bit 14: Nested Task
-					unsigned int m_unMD   : 1;  // Bit 15: Mode Flag
-					unsigned int m_unRF   : 1;  // Bit 16: Resume Flag
-					unsigned int m_unVM   : 1;  // Bit 17: Virtual 8086 Mode Flag
-					unsigned int m_unAC   : 1;  // Bit 18: Alignment Check
-					unsigned int m_unVIF  : 1;  // Bit 19: Virtual Interrupt Flag
-					unsigned int m_unVIP  : 1;  // Bit 20: Virtual Interrupt Pending
-					unsigned int m_unID   : 1;  // Bit 21: ID Flag
-					unsigned int          : 8;  // Bit 22-29: Reserved
-					unsigned int          : 1;  // Bit 30: Reserved
-					unsigned int m_unAI   : 1;  // Bit 31: Alignment Indicator
+					unsigned int m_unNT : 1;  // Bit 14: Nested Task
+					unsigned int m_unMD : 1;  // Bit 15: Mode Flag
+					unsigned int m_unRF : 1;  // Bit 16: Resume Flag
+					unsigned int m_unVM : 1;  // Bit 17: Virtual 8086 Mode Flag
+					unsigned int m_unAC : 1;  // Bit 18: Alignment Check
+					unsigned int m_unVIF : 1;  // Bit 19: Virtual Interrupt Flag
+					unsigned int m_unVIP : 1;  // Bit 20: Virtual Interrupt Pending
+					unsigned int m_unID : 1;  // Bit 21: ID Flag
+					unsigned int : 8;  // Bit 22-29: Reserved
+					unsigned int : 1;  // Bit 30: Reserved
+					unsigned int m_unAI : 1;  // Bit 31: Alignment Indicator
 				};
 			};
-
-			// ----------------------------------------------------------------
-			// Segments
-			// ----------------------------------------------------------------
-
-			unsigned short m_unCS;
-			unsigned short m_unDS;
-			unsigned short m_unSS;
-			unsigned short m_unES;
-			unsigned short m_unFS;
-			unsigned short m_unGS;
 
 			// ----------------------------------------------------------------
 			// Registers (General)
@@ -5229,23 +5239,35 @@ namespace Detours {
 				unsigned short m_unDI;
 				unsigned char m_unDIL;
 			};
+		} RAW_NATIVE_CONTEXT32, *PRAW_NATIVE_CONTEXT32;
 
-			// ----------------------------------------------------------------
-			// Registers (MMX)
-			// ----------------------------------------------------------------
-
-			RAW_HOOK_M64 m_MM0;
-			RAW_HOOK_M64 m_MM1;
-			RAW_HOOK_M64 m_MM2;
-			RAW_HOOK_M64 m_MM3;
-			RAW_HOOK_M64 m_MM4;
-			RAW_HOOK_M64 m_MM5;
-			RAW_HOOK_M64 m_MM6;
-			RAW_HOOK_M64 m_MM7;
+		typedef struct _RAW_CONTEXT32 : public RAW_NATIVE_CONTEXT32 {
 
 			// ----------------------------------------------------------------
 			// Registers (SIMD)
 			// ----------------------------------------------------------------
+
+			union {
+				unsigned int m_unMXCSR;
+				struct {
+					unsigned int m_unInvalidOperation : 1;
+					unsigned int m_unDenormalizedOperand : 1;
+					unsigned int m_unDivideByZero : 1;
+					unsigned int m_unOverflow : 1;
+					unsigned int m_unUnderflow : 1;
+					unsigned int m_unPrecision : 1;
+					unsigned int m_unDenormalsAreZeros : 1;
+					unsigned int m_unInvalidOperationMask : 1;
+					unsigned int m_unDenormalMask : 1;
+					unsigned int m_unDivideByZeroMask : 1;
+					unsigned int m_unOverflowMask : 1;
+					unsigned int m_unUnderflowMask : 1;
+					unsigned int m_unPrecisionMask : 1;
+					unsigned int m_unRoundingControl0 : 1;
+					unsigned int m_unRoundingControl1 : 1;
+					unsigned int m_unFlushToZero : 1;
+				} MXCSR;
+			};
 
 			union {
 				RAW_HOOK_M512 m_ZMM0;
@@ -5300,9 +5322,9 @@ namespace Detours {
 			// ----------------------------------------------------------------
 
 			RAW_HOOK_FPU m_FPU;
-		} RAW_HOOK_CONTEXT32, *PRAW_HOOK_CONTEXT32;
+		} RAW_CONTEXT32, *PRAW_CONTEXT32;
 
-		typedef struct _RAW_HOOK_CONTEXT64 {
+		typedef struct _RAW_NATIVE_CONTEXT64 {
 
 			// ----------------------------------------------------------------
 			// Flags
@@ -5313,44 +5335,33 @@ namespace Detours {
 				unsigned int m_unEFLAGS;
 				unsigned short m_unFLAGS;
 				struct {
-					unsigned int m_unCF   : 1;  // Bit 0: Carry Flag
-					unsigned int          : 1;  // Bit 1: Reserved
-					unsigned int m_unPF   : 1;  // Bit 2: Parity Flag
-					unsigned int          : 1;  // Bit 3: Reserved
-					unsigned int m_unAF   : 1;  // Bit 4: Auxiliary Carry Flag
-					unsigned int          : 1;  // Bit 5: Reserved
-					unsigned int m_unZF   : 1;  // Bit 6: Zero Flag
-					unsigned int m_unSF   : 1;  // Bit 7: Sign Flag
-					unsigned int m_unTF   : 1;  // Bit 8: Trap Flag
-					unsigned int m_unIF   : 1;  // Bit 9: Interrupt Enable Flag
-					unsigned int m_unDF   : 1;  // Bit 10: Direction Flag
-					unsigned int m_unOF   : 1;  // Bit 11: Overflow Flag
+					unsigned int m_unCF : 1;  // Bit 0: Carry Flag
+					unsigned int : 1;  // Bit 1: Reserved
+					unsigned int m_unPF : 1;  // Bit 2: Parity Flag
+					unsigned int : 1;  // Bit 3: Reserved
+					unsigned int m_unAF : 1;  // Bit 4: Auxiliary Carry Flag
+					unsigned int : 1;  // Bit 5: Reserved
+					unsigned int m_unZF : 1;  // Bit 6: Zero Flag
+					unsigned int m_unSF : 1;  // Bit 7: Sign Flag
+					unsigned int m_unTF : 1;  // Bit 8: Trap Flag
+					unsigned int m_unIF : 1;  // Bit 9: Interrupt Enable Flag
+					unsigned int m_unDF : 1;  // Bit 10: Direction Flag
+					unsigned int m_unOF : 1;  // Bit 11: Overflow Flag
 					unsigned int m_unIOPL : 2;  // Bit 12-13: I/O Privilege Level
-					unsigned int m_unNT   : 1;  // Bit 14: Nested Task
-					unsigned int m_unMD   : 1;  // Bit 15: Mode Flag
-					unsigned int m_unRF   : 1;  // Bit 16: Resume Flag
-					unsigned int m_unVM   : 1;  // Bit 17: Virtual 8086 Mode Flag
-					unsigned int m_unAC   : 1;  // Bit 18: Alignment Check
-					unsigned int m_unVIF  : 1;  // Bit 19: Virtual Interrupt Flag
-					unsigned int m_unVIP  : 1;  // Bit 20: Virtual Interrupt Pending
-					unsigned int m_unID   : 1;  // Bit 21: ID Flag
-					unsigned int          : 8;  // Bit 22-29: Reserved
-					unsigned int          : 1;  // Bit 30: Reserved
-					unsigned int m_unAI   : 1;  // Bit 31: Alignment Indicator
-					unsigned int          : 32; // Bit 32-63: Reserved
+					unsigned int m_unNT : 1;  // Bit 14: Nested Task
+					unsigned int m_unMD : 1;  // Bit 15: Mode Flag
+					unsigned int m_unRF : 1;  // Bit 16: Resume Flag
+					unsigned int m_unVM : 1;  // Bit 17: Virtual 8086 Mode Flag
+					unsigned int m_unAC : 1;  // Bit 18: Alignment Check
+					unsigned int m_unVIF : 1;  // Bit 19: Virtual Interrupt Flag
+					unsigned int m_unVIP : 1;  // Bit 20: Virtual Interrupt Pending
+					unsigned int m_unID : 1;  // Bit 21: ID Flag
+					unsigned int : 8;  // Bit 22-29: Reserved
+					unsigned int : 1;  // Bit 30: Reserved
+					unsigned int m_unAI : 1;  // Bit 31: Alignment Indicator
+					unsigned int : 32; // Bit 32-63: Reserved
 				};
 			};
-
-			// ----------------------------------------------------------------
-			// Segments
-			// ----------------------------------------------------------------
-
-			unsigned short m_unCS;
-			unsigned short m_unDS;
-			unsigned short m_unSS;
-			unsigned short m_unES;
-			unsigned short m_unFS;
-			unsigned short m_unGS;
 
 			// ----------------------------------------------------------------
 			// Registers (General)
@@ -5495,23 +5506,35 @@ namespace Detours {
 				unsigned short m_unR15W;
 				unsigned char m_unR15B;
 			};
+		} RAW_NATIVE_CONTEXT64, *PRAW_NATIVE_CONTEXT64;
 
-			// ----------------------------------------------------------------
-			// Registers (MMX)
-			// ----------------------------------------------------------------
-
-			RAW_HOOK_M64 m_MM0;
-			RAW_HOOK_M64 m_MM1;
-			RAW_HOOK_M64 m_MM2;
-			RAW_HOOK_M64 m_MM3;
-			RAW_HOOK_M64 m_MM4;
-			RAW_HOOK_M64 m_MM5;
-			RAW_HOOK_M64 m_MM6;
-			RAW_HOOK_M64 m_MM7;
+		typedef struct _RAW_CONTEXT64 : public RAW_NATIVE_CONTEXT64 {
 
 			// ----------------------------------------------------------------
 			// Registers (SIMD)
 			// ----------------------------------------------------------------
+
+			union {
+				unsigned int m_unMXCSR;
+				struct {
+					unsigned int m_unInvalidOperation : 1;
+					unsigned int m_unDenormalizedOperand : 1;
+					unsigned int m_unDivideByZero : 1;
+					unsigned int m_unOverflow : 1;
+					unsigned int m_unUnderflow : 1;
+					unsigned int m_unPrecision : 1;
+					unsigned int m_unDenormalsAreZeros : 1;
+					unsigned int m_unInvalidOperationMask : 1;
+					unsigned int m_unDenormalMask : 1;
+					unsigned int m_unDivideByZeroMask : 1;
+					unsigned int m_unOverflowMask : 1;
+					unsigned int m_unUnderflowMask : 1;
+					unsigned int m_unPrecisionMask : 1;
+					unsigned int m_unRoundingControl0 : 1;
+					unsigned int m_unRoundingControl1 : 1;
+					unsigned int m_unFlushToZero : 1;
+				} MXCSR;
+			};
 
 			union {
 				RAW_HOOK_M512 m_ZMM0;
@@ -5710,14 +5733,16 @@ namespace Detours {
 			// ----------------------------------------------------------------
 
 			RAW_HOOK_FPU m_FPU;
-		} RAW_HOOK_CONTEXT64, *PRAW_HOOK_CONTEXT64;
+		} RAW_CONTEXT64, *PRAW_CONTEXT64;
 
 #ifdef _M_X64
-		typedef RAW_HOOK_CONTEXT64 RAW_HOOK_CONTEXT;
-		typedef PRAW_HOOK_CONTEXT64 PRAW_HOOK_CONTEXT;
+		typedef RAW_NATIVE_CONTEXT64 RAW_NATIVE_CONTEXT;
+		typedef RAW_CONTEXT64 RAW_CONTEXT;
+		typedef PRAW_CONTEXT64 PRAW_CONTEXT;
 #elif _M_IX86
-		typedef RAW_HOOK_CONTEXT32 RAW_HOOK_CONTEXT;
-		typedef PRAW_HOOK_CONTEXT32 PRAW_HOOK_CONTEXT;
+		typedef RAW_NATIVE_CONTEXT32 RAW_NATIVE_CONTEXT;
+		typedef RAW_CONTEXT32 RAW_CONTEXT;
+		typedef PRAW_CONTEXT32 PRAW_CONTEXT;
 #endif
 
 		// ----------------------------------------------------------------
@@ -5725,9 +5750,9 @@ namespace Detours {
 		// ----------------------------------------------------------------
 
 #ifdef _M_X64
-		using fnRawHookCallBack = bool(__fastcall*)(PRAW_HOOK_CONTEXT pCTX);
+		using fnRawHookCallBack = bool(__fastcall*)(PRAW_CONTEXT pCTX);
 #elif _M_IX86
-		using fnRawHookCallBack = bool(__cdecl*)(PRAW_HOOK_CONTEXT pCTX);
+		using fnRawHookCallBack = bool(__cdecl*)(PRAW_CONTEXT pCTX);
 #endif
 
 		// ----------------------------------------------------------------
@@ -5745,7 +5770,7 @@ namespace Detours {
 			bool Release();
 
 		public:
-			bool Hook(const fnRawHookCallBack pCallBack);
+			bool Hook(const fnRawHookCallBack pCallBack, bool bNative = false);
 			bool UnHook();
 
 		public:

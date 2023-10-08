@@ -728,13 +728,15 @@ namespace Terminal {
 
 		if (ColorPair.m_unBackground != COLOR::COLOR_AUTO) {
 			unAttributes = static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unBackground) & 0x0F) << 4);
-		} else {
+		}
+		else {
 			unAttributes = static_cast<unsigned char>(CurrentColorPair.m_unBackground);
 		}
 
 		if (ColorPair.m_unForeground != COLOR::COLOR_AUTO) {
 			unAttributes |= static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unForeground) & 0x0F));
-		} else {
+		}
+		else {
 			unAttributes |= static_cast<unsigned char>(CurrentColorPair.m_unForeground);
 		}
 
@@ -781,13 +783,15 @@ namespace Terminal {
 
 		if (ColorPair.m_unBackground != COLOR::COLOR_AUTO) {
 			unAttributes = static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unBackground) & 0x0F) << 4);
-		} else {
+		}
+		else {
 			unAttributes = static_cast<unsigned char>(CurrentColorPair.m_unBackground);
 		}
 
 		if (ColorPair.m_unForeground != COLOR::COLOR_AUTO) {
 			unAttributes |= static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unForeground) & 0x0F));
-		} else {
+		}
+		else {
 			unAttributes |= static_cast<unsigned char>(CurrentColorPair.m_unForeground);
 		}
 
@@ -1459,6 +1463,32 @@ namespace Terminal {
 		return true;
 	}
 
+	bool Server::Launch() {
+		if (!m_hPipe || (m_hPipe == INVALID_HANDLE_VALUE)) {
+			return false;
+		}
+
+		auto MessagePtr = std::make_unique<TerminalMessage>();
+		if (!MessagePtr) {
+			Close();
+			return false;
+		}
+
+		while (MessagePtr->GetAction() != TERMINAL_MESSAGE_ACTION::ACTION_CLOSE) {
+			memset(MessagePtr.get(), 0, sizeof(TerminalMessage));
+
+			if (!Receive(MessagePtr)) {
+				return false;
+			}
+
+			if (!Process(MessagePtr)) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	bool Server::Send(const std::unique_ptr<TerminalMessage>& ptrMessage) {
 		if (!ptrMessage) {
 			return false;
@@ -1469,7 +1499,11 @@ namespace Terminal {
 		}
 
 		DWORD unNumberOfBytesWritten = 0;
-		if (WriteFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesWritten, nullptr) == FALSE) {
+		if (!WriteFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesWritten, nullptr)) {
+			if (GetLastError() == ERROR_NO_DATA) {
+				return true;
+			}
+
 			return false;
 		}
 
@@ -1490,7 +1524,12 @@ namespace Terminal {
 		}
 
 		DWORD unNumberOfBytesRead = 0;
-		if (ReadFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesRead, nullptr) == FALSE) {
+		if (!ReadFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesRead, nullptr)) {
+			if (GetLastError() == ERROR_BROKEN_PIPE) {
+				ptrMessage->SetAction(TERMINAL_MESSAGE_ACTION::ACTION_CLOSE);
+				return true;
+			}
+
 			return false;
 		}
 
@@ -1805,48 +1844,6 @@ namespace Terminal {
 		return true;
 	}
 
-	bool Client::Send(const std::unique_ptr<TerminalMessage>& ptrMessage) {
-		if (!ptrMessage) {
-			return false;
-		}
-
-		if (!m_hPipe || (m_hPipe == INVALID_HANDLE_VALUE)) {
-			return false;
-		}
-
-		DWORD unNumberOfBytesWritten = 0;
-		if (WriteFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesWritten, nullptr) == FALSE) {
-			return false;
-		}
-
-		if (unNumberOfBytesWritten != sizeof(TerminalMessage)) {
-			return false;
-		}
-
-		return true;
-	}
-
-	bool Client::Receive(const std::unique_ptr<TerminalMessage>& ptrMessage) {
-		if (!ptrMessage) {
-			return false;
-		}
-
-		if (!m_hPipe || (m_hPipe == INVALID_HANDLE_VALUE)) {
-			return false;
-		}
-
-		DWORD unNumberOfBytesRead = 0;
-		if (ReadFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesRead, nullptr) == FALSE) {
-			return false;
-		}
-
-		if (unNumberOfBytesRead != sizeof(TerminalMessage)) {
-			return false;
-		}
-
-		return true;
-	}
-
 	bool Client::ReadA(char* const szBuffer, const unsigned int unLength) {
 		if (!szBuffer) {
 			return false;
@@ -2063,7 +2060,7 @@ namespace Terminal {
 		if (!Send(MessagePtr)) {
 			Close();
 			return false;
-	}
+		}
 
 		if (!Receive(MessagePtr)) {
 			Close();
@@ -2940,5 +2937,47 @@ namespace Terminal {
 
 	const HANDLE Client::GetPipe() const {
 		return m_hPipe;
+	}
+
+	bool Client::Send(const std::unique_ptr<TerminalMessage>& ptrMessage) {
+		if (!ptrMessage) {
+			return false;
+		}
+
+		if (!m_hPipe || (m_hPipe == INVALID_HANDLE_VALUE)) {
+			return false;
+		}
+
+		DWORD unNumberOfBytesWritten = 0;
+		if (!WriteFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesWritten, nullptr)) {
+			return false;
+		}
+
+		if (unNumberOfBytesWritten != sizeof(TerminalMessage)) {
+			return false;
+		}
+
+		return true;
+	}
+
+	bool Client::Receive(const std::unique_ptr<TerminalMessage>& ptrMessage) {
+		if (!ptrMessage) {
+			return false;
+		}
+
+		if (!m_hPipe || (m_hPipe == INVALID_HANDLE_VALUE)) {
+			return false;
+		}
+
+		DWORD unNumberOfBytesRead = 0;
+		if (!ReadFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesRead, nullptr)) {
+			return false;
+		}
+
+		if (unNumberOfBytesRead != sizeof(TerminalMessage)) {
+			return false;
+		}
+
+		return true;
 	}
 }

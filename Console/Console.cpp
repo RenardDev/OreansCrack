@@ -246,7 +246,7 @@ bool InjectLibrary(Terminal::Console& Console, Terminal::Server& TerminalServer,
 		return false;
 	}
 
-	HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0x100000 /* 1 MiB */, reinterpret_cast<LPTHREAD_START_ROUTINE>(reinterpret_cast<size_t>(pBuffer) + unLoaderOffset), reinterpret_cast<char*>(pBuffer) + unSize, CREATE_SUSPENDED, nullptr);
+	HANDLE hThread = CreateRemoteThread(hProcess, nullptr, NULL, reinterpret_cast<LPTHREAD_START_ROUTINE>(reinterpret_cast<size_t>(pBuffer) + unLoaderOffset), reinterpret_cast<char*>(pBuffer) + unSize, CREATE_SUSPENDED, nullptr);
 	if (!hThread || (hThread == INVALID_HANDLE_VALUE)) {
 		Console.tprintf(Terminal::COLOR::COLOR_RED, _T("[!] Failed to inject library (Invalid thread handle)\n"));
 		return false;
@@ -358,10 +358,11 @@ bool HackProcess(Terminal::Console& Console, Terminal::Server& TerminalServer, c
 
 		if (!hRemoteNTDLL || !hRemoteKernel32) {
 			ResumeThread(hProcessThread);
-			Sleep(1);
 			SuspendThread(hProcessThread);
 		}
 	}
+
+	Sleep(10000);
 
 	LOADER_DATA LoaderData;
 	memset(&LoaderData, 0, sizeof(LoaderData));
@@ -582,29 +583,7 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 			return -1;
 		}
 
-		auto MessagePtr = std::make_unique<Terminal::TerminalMessage>();
-		if (!MessagePtr) {
-			CloseHandle(pi.hThread);
-			TerminateProcess(pi.hProcess, 0);
-			CloseHandle(pi.hProcess);
-			return -1;
-		}
-
-		while (MessagePtr->GetAction() != Terminal::TERMINAL_MESSAGE_ACTION::ACTION_CLOSE) {
-			memset(MessagePtr.get(), 0, sizeof(Terminal::TerminalMessage));
-
-			if (!TerminalServer.Receive(MessagePtr)) {
-				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("RECEIVE ERROR!\n"));
-				break;
-			}
-
-			if (!TerminalServer.Process(MessagePtr)) {
-				Console.tprintf(Terminal::COLOR::COLOR_RED, _T("PROCESS ERROR!\n"));
-				break;
-			}
-		}
-
-		TerminalServer.Close();
+		TerminalServer.Launch();
 
 		CloseHandle(pi.hThread);
 		CloseHandle(pi.hProcess);
