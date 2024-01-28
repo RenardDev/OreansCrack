@@ -45,6 +45,13 @@ DECLARE_INLINE_HOOK(
 );
 
 DECLARE_INLINE_HOOK(
+	VirtualAlloc,
+	LPVOID,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect
+);
+
+DECLARE_INLINE_HOOK(
 	VirtualProtect,
 	BOOL,
 	WINAPI,
@@ -57,6 +64,9 @@ DECLARE_INLINE_HOOK(
 	WINAPI,
 	HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, LPDWORD lpThreadId
 );
+
+bool bOnce = false;
+bool bOnceDump = false;
 
 bool SuspendOtherThreads() {
 	auto pTEB = Detours::GetTEB();
@@ -261,16 +271,6 @@ DEFINE_INLINE_HOOK(
 
 bool bMonitorMemory = false;
 
-Detours::Hook::RawHook RawVMHook;
-bool __cdecl VMHook(Detours::Hook::PRAW_CONTEXT pCTX) {
-	TerminalClient.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[+] VM call!\n"));
-
-	pCTX->m_unESP -= 4;
-	*reinterpret_cast<unsigned int*>(pCTX->m_unESP) = reinterpret_cast<unsigned int>(RawVMHook.GetTrampoline());
-
-	return true;
-}
-
 fnVM pVM = nullptr;
 void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 	switch (unIndex) {
@@ -382,187 +382,187 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 			unsigned int unMacroIndex = pData[0];
 			unsigned int* pMacroResult = reinterpret_cast<unsigned int*>(pData[13]);
 			switch (unMacroIndex) {
-				case 0x3A: { // Checking Input and Output files
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x4C: { // Stealth...
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x4D: { // Stealth...
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x05: { // Reading Protection Macros
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x16: { // Reading Protection Macros
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x4F: { // Initializing VM machines
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x5D: { // Ansi Strings to Virtualize
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x68: { // Ansi Strings to Virtualize
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x5F: { // Ansi Strings to Virtualize
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x5E: { // Unicode Strings to Virtualize
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x69: { // Unicode Strings to Virtualize
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x60: { // Unicode Strings to Virtualize
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x2A: { // Virtual Machines Generation
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x15: { // Virtual Machines Generation
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x10: { // Virtual Machines Generation
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x12: { // Virtual Machines Generation
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x11: { // Virtual Machines Generation
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x14: { // Virtual Machines Generation
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x2C: { // Potecting Macros (Mutation & StrEncrypt)
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x2D: { // Potecting Macros (Mutation & StrEncrypt)
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x62: { // Potecting Macros (Mutation & StrEncrypt)
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x63: { // Potecting Macros (Mutation & StrEncrypt)
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x64: { // Potecting Macros (Virtualization)
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x08: { // Compressing Virtual Machines
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x2F: { // Compressing Virtual Machines
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x32: { // Compressing Virtual Machines
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x57: { // Finalizing Protection
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x44: { // Taggant
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x45: { // Taggant
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x43: { // Taggant
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x6D: { // Code Signing
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x6E: { // Code Signing
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x41: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x17: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x1C: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x6B: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x58: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x59: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x18: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x1A: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x1B: { // Unknown
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x65: { // Called when Cancel pressed
-					pVM(unIndex, pData);
-					return;
-				}
-				case 0x4E: { // Rebuilding?
-					pVM(unIndex, pData);
-					return;
-				}
+			case 0x3A: { // Checking Input and Output files
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x4C: { // Stealth...
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x4D: { // Stealth...
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x05: { // Reading Protection Macros
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x16: { // Reading Protection Macros
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x4F: { // Initializing VM machines
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x5D: { // Ansi Strings to Virtualize
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x68: { // Ansi Strings to Virtualize
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x5F: { // Ansi Strings to Virtualize
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x5E: { // Unicode Strings to Virtualize
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x69: { // Unicode Strings to Virtualize
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x60: { // Unicode Strings to Virtualize
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x2A: { // Virtual Machines Generation
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x15: { // Virtual Machines Generation
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x10: { // Virtual Machines Generation
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x12: { // Virtual Machines Generation
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x11: { // Virtual Machines Generation
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x14: { // Virtual Machines Generation
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x2C: { // Potecting Macros (Mutation & StrEncrypt)
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x2D: { // Potecting Macros (Mutation & StrEncrypt)
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x62: { // Potecting Macros (Mutation & StrEncrypt)
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x63: { // Potecting Macros (Mutation & StrEncrypt)
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x64: { // Potecting Macros (Virtualization)
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x08: { // Compressing Virtual Machines
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x2F: { // Compressing Virtual Machines
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x32: { // Compressing Virtual Machines
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x57: { // Finalizing Protection
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x44: { // Taggant
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x45: { // Taggant
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x43: { // Taggant
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x6D: { // Code Signing
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x6E: { // Code Signing
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x41: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x17: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x1C: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x6B: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x58: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x59: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x18: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x1A: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x1B: { // Unknown
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x65: { // Called when Cancel pressed
+				pVM(unIndex, pData);
+				return;
+			}
+			case 0x4E: { // Rebuilding?
+				pVM(unIndex, pData);
+				return;
+			}
 
-				default: {
-					pVM(unIndex, pData);
+			default: {
+				pVM(unIndex, pData);
 
-					//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] CallMacro (ID=0x%02X)\n", unMacroIndex);
-					//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+]  Data: %08X (%08X)\n", pMacroResult, *pMacroResult);
+				TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+] CallMacro (ID=0x%02X)\n"), unMacroIndex);
+				TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+]  Data: %08X (%08X)\n"), pMacroResult, *pMacroResult);
 
-					return;
-				}
+				return;
+			}
 			}
 			return;
 		}
@@ -630,17 +630,47 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 		default: {
 			pVM(unIndex, pData);
 
-			//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] CallVM (ID=0x%02X) from 0x%08X (RVA: 0x%08X)\n", unIndex, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
-			//TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+]  Data: ");
-			//for (unsigned char i = 0; i < 14; ++i) {
-//				TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "%08X ", pData[i]);
-	//		}
-	//		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "\n");
+			TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+] CallVM (ID=0x%02X) from 0x%08X (RVA: 0x%08X)\n"), unIndex, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+			TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+]  Data: "));
+			for (unsigned char i = 0; i < 14; ++i) {
+				TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("%08X "), pData[i]);
+			}
+			TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("\n"));
 
 			return;
 		}
 	}
 	return;
+}
+
+Detours::Hook::RawHook RawVMHook;
+bool __cdecl VMHook(Detours::Hook::PRAW_CONTEXT pCTX) {
+	TerminalClient.tprintf(Terminal::COLOR::COLOR_GREEN, _T("[+] VM call!\n"));
+
+	pVM = reinterpret_cast<fnVM>(RawVMHook.GetTrampoline());
+	pCTX->Stack.push(VM_Hook);
+
+	return true;
+}
+
+DEFINE_INLINE_HOOK(
+	VirtualAlloc, {
+		HMODULE hKernel32 = GetModuleHandle(_T("kernel32.dll"));
+		if (!hKernel32) {
+			return nullptr;
+		}
+
+		return GetProcAddress(hKernel32, "VirtualAlloc");
+	},
+	LPVOID,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect
+) {
+	if (bMonitorMemory && (dwSize >= 0x1000)) {
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+] Memory allocated! (lpAddress=0x%08X, dwSize=0x%08X, flAllocationType=0x%08X, flProtect=0x%08X)\n"), reinterpret_cast<DWORD>(lpAddress), dwSize, flAllocationType, flProtect);
+	}
+
+	return g_HookVirtualAlloc.Call(lpAddress, dwSize, flAllocationType, flProtect);
 }
 
 DEFINE_INLINE_HOOK(
@@ -657,14 +687,70 @@ DEFINE_INLINE_HOOK(
 	LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect
 ) {
 	BOOL bRes = g_HookVirtualProtect.Call(lpAddress, dwSize, flNewProtect, lpflOldProtect);
-	//if (bMonitorMemory && (dwSize > 0x1000)) {
-	//	TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, "[+] Memory protected! (lpAddress=0x%08X, dwSize=0x%08X, flNewProtect=0x%08X)\n", reinterpret_cast<DWORD>(lpAddress), dwSize, flNewProtect);
-	//}
+	if (bMonitorMemory && (dwSize >= 0x1000)) {
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+] Memory protected! (lpAddress=0x%08X, dwSize=0x%08X, flNewProtect=0x%08X)\n"), reinterpret_cast<DWORD>(lpAddress), dwSize, flNewProtect);
+	}
+
 	return bRes;
 }
 
-bool bOnce = false;
-bool bOnceDump = false;
+void DumpMemory() {
+	FILE* pDumpFile = nullptr;
+	if (_tfopen_s(&pDumpFile, _T("dump.txt"), _T("w+")) != 0) {
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("Error opening dump file for writing.\n"));
+		return;
+	}
+
+	if (!pDumpFile) {
+		TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("Error opening dump file for writing.\n"));
+		return;
+	}
+
+	MEMORY_BASIC_INFORMATION mbi;
+	memset(&mbi, 0, sizeof(mbi));
+
+	SYSTEM_INFO sysInfo;
+	GetSystemInfo(&sysInfo);
+
+	for (size_t unAddress = (size_t)sysInfo.lpMinimumApplicationAddress; unAddress < (size_t)sysInfo.lpMaximumApplicationAddress;) {
+		if (!VirtualQuery((void*)unAddress, &mbi, sizeof(mbi))) {
+			break;
+		}
+
+		// Check for any valid memory region
+		if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+			TCHAR szFileName[128];
+			memset(szFileName, 0, sizeof(szFileName));
+
+			_sntprintf_s(szFileName, sizeof(szFileName) - 1, _T("0x%08X_memory_dump.bin"), unAddress);
+
+			FILE* pFile = nullptr;
+			if (_tfopen_s(&pFile, szFileName, _T("wb+")) == 0) {
+				DWORD bytesRead;
+				BYTE* buffer = new BYTE[mbi.RegionSize];
+
+				if (ReadProcessMemory(GetCurrentProcess(), (LPVOID)unAddress, buffer, mbi.RegionSize, &bytesRead)) {
+					fwrite(buffer, 1, bytesRead, pFile);
+					TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+] Addr: 0x%08X Size: 0x%08X to `%s`.\n"), unAddress, bytesRead, szFileName);
+					if (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
+						_ftprintf(pDumpFile, _T("0x%08X;C;%s\n"), unAddress, szFileName);
+					} else {
+						_ftprintf(pDumpFile, _T("0x%08X;D;%s\n"), unAddress, szFileName);
+					}
+				} else {
+					TerminalClient.tprintf(Terminal::COLOR::COLOR_RED, _T("[+] Addr: 0x%08X Size: 0x%08X to `FAIL`.\n"), unAddress, bytesRead);
+				}
+
+				delete[] buffer;
+				fclose(pFile);
+			}
+		}
+
+		unAddress += mbi.RegionSize;
+	}
+
+	fclose(pDumpFile);
+}
 
 DEFINE_INLINE_HOOK(
 	CreateRemoteThreadEx, {
@@ -717,6 +803,9 @@ DEFINE_INLINE_HOOK(
 			RawVMHook.Set(pVM);
 			RawVMHook.Hook(VMHook, true);
 			TerminalClient.tprintf(Terminal::COLOR::COLOR_BLUE, _T("[+] Hooked VM call!\n"));
+
+			//DumpMemory();
+
 		}
 	}
 
@@ -769,7 +858,7 @@ DWORD WINAPI MainRoutine(LPVOID lpThreadParameter) {
 
 	g_pSelf = GetModuleHandle(nullptr);
 
-	TerminalClient.tprintf(Terminal::COLOR::COLOR_WHITE, _T("OreansCrack [Version 2.0.0]\n\n"));
+	TerminalClient.tprintf(Terminal::COLOR::COLOR_WHITE, _T("OreansCrack [Version 2.1.0]\n\n"));
 	TerminalClient.tprintf(Terminal::COLOR::COLOR_WHITE, _T("[OreansCrack] Loading... "));
 
 	if (!g_HookManager.HookAll()) {

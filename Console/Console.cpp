@@ -362,6 +362,7 @@ bool HackProcess(Terminal::Console& Console, Terminal::Server& TerminalServer, c
 		}
 	}
 
+	Console.tprintf(Terminal::COLOR::COLOR_CYAN, _T("[i] Paused for debugger.\n"));
 	Sleep(10000);
 
 	LOADER_DATA LoaderData;
@@ -405,7 +406,7 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 
 	Terminal::Window Window;
 	if (Window.Open()) {
-		Terminal::Screen Screen(&Window);
+		Terminal::Screen Screen(&Window, true);
 		Terminal::Console Console(&Screen);
 
 		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_BLACK, 0x1B1B1B);
@@ -425,7 +426,7 @@ int _tmain(int nArgsCount, PTCHAR* pArgs, PTCHAR* pEnvVars) {
 		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_YELLOW, 0xFFFF00);
 		Screen.ChangeColorPalette(Terminal::COLOR::COLOR_WHITE, 0xFAFAFA);
 
-		Console.tprintf(Terminal::COLOR::COLOR_WHITE, _T("OreansConsole [Version 2.0.0]\n\n"));
+		Console.tprintf(Terminal::COLOR::COLOR_WHITE, _T("OreansConsole [Version 2.1.0]\n\n"));
 
 		TCHAR szMainFileName[16];
 		memset(szMainFileName, 0, sizeof(szMainFileName));

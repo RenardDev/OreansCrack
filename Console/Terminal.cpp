@@ -728,15 +728,13 @@ namespace Terminal {
 
 		if (ColorPair.m_unBackground != COLOR::COLOR_AUTO) {
 			unAttributes = static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unBackground) & 0x0F) << 4);
-		}
-		else {
+		} else {
 			unAttributes = static_cast<unsigned char>(CurrentColorPair.m_unBackground);
 		}
 
 		if (ColorPair.m_unForeground != COLOR::COLOR_AUTO) {
 			unAttributes |= static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unForeground) & 0x0F));
-		}
-		else {
+		} else {
 			unAttributes |= static_cast<unsigned char>(CurrentColorPair.m_unForeground);
 		}
 
@@ -783,15 +781,13 @@ namespace Terminal {
 
 		if (ColorPair.m_unBackground != COLOR::COLOR_AUTO) {
 			unAttributes = static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unBackground) & 0x0F) << 4);
-		}
-		else {
+		} else {
 			unAttributes = static_cast<unsigned char>(CurrentColorPair.m_unBackground);
 		}
 
 		if (ColorPair.m_unForeground != COLOR::COLOR_AUTO) {
 			unAttributes |= static_cast<unsigned char>((static_cast<unsigned char>(ColorPair.m_unForeground) & 0x0F));
-		}
-		else {
+		} else {
 			unAttributes |= static_cast<unsigned char>(CurrentColorPair.m_unForeground);
 		}
 
@@ -2950,6 +2946,7 @@ namespace Terminal {
 
 		DWORD unNumberOfBytesWritten = 0;
 		if (!WriteFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesWritten, nullptr)) {
+			// NOTE: Add checks for possible pipe problems.
 			return false;
 		}
 
@@ -2971,6 +2968,7 @@ namespace Terminal {
 
 		DWORD unNumberOfBytesRead = 0;
 		if (!ReadFile(m_hPipe, ptrMessage.get(), sizeof(TerminalMessage), &unNumberOfBytesRead, nullptr)) {
+			// NOTE: Add checks for possible pipe problems.
 			return false;
 		}
 
