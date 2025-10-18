@@ -13,24 +13,30 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Detours">
+      <UniqueIdentifier>{dc79b947-45b3-4c94-a425-5db4fc0bfd54}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Terminal">
+      <UniqueIdentifier>{42c765fe-42ee-4d1f-8dbc-8788dc7a632f}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Console.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
-    <ClCompile Include="Detours.cpp">
-      <Filter>Исходные файлы</Filter>
+    <ClCompile Include="Detours\Detours.cpp">
+      <Filter>Detours</Filter>
     </ClCompile>
-    <ClCompile Include="Terminal.cpp">
-      <Filter>Исходные файлы</Filter>
+    <ClCompile Include="Terminal\Terminal.cpp">
+      <Filter>Terminal</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Detours.h">
-      <Filter>Файлы заголовков</Filter>
+    <ClInclude Include="Detours\Detours.h">
+      <Filter>Detours</Filter>
     </ClInclude>
-    <ClInclude Include="Terminal.h">
-      <Filter>Файлы заголовков</Filter>
+    <ClInclude Include="Terminal\Terminal.h">
+      <Filter>Terminal</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

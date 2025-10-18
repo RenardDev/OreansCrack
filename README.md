@@ -9,12 +9,6 @@ WIP PoC for license emulation in Oreans products.
 - Enable additional options.
 
 # Short manual
-1. Copy `Console.exe` and `Library.dll` into product directory.
-2. Run `Console.exe`.
-- `Console.exe /cv` - Code Virtualizer
-- `Console.exe /cv64` - Code Virtualizer x64
-- `Console.exe /th` - Themida
-- `Console.exe /th64` - Themida x64
-- `Console.exe /wl` - WinLicense
-- `Console.exe /wl64` - WinLicense x64
-3. Done
+1. Copy `Console32.exe` to a convenient location and copy `oc32.dll` to the product directory.
+2. Run `Console32.exe /install`.
+3. Done.

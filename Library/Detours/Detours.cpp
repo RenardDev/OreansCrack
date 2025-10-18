@@ -1,27 +1,41 @@
-﻿#include "Detours.h"
+#include "Detours.h"
 
 // Default
 #include <tchar.h>
+#include <DbgHelp.h>
+
+// C++
+#include <cstring>
 
 // STL
 #include <unordered_map>
+#include <unordered_set>
+#include <deque>
+
+#ifndef MAX
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+
+#ifndef MIN
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
 
 // RTTI
 
-#define BCD_NOTVISIBLE			0x00000001
-#define BCD_AMBIGUOUS			0x00000002
-#define BCD_PRIVORPROTBASE		0x00000004
-#define BCD_PRIVORPROTINCOMPOBJ	0x00000008
-#define BCD_VBOFCONTOBJ			0x00000010
-#define BCD_NONPOLYMORPHIC		0x00000020
-#define BCD_HASPCHD				0x00000040 // pClassHierarchyDescriptor field is present
+#define BCD_NOTVISIBLE 0x00000001
+#define BCD_AMBIGUOUS 0x00000002
+#define BCD_PRIVORPROTBASE 0x00000004
+#define BCD_PRIVORPROTINCOMPOBJ 0x00000008
+#define BCD_VBOFCONTOBJ 0x00000010
+#define BCD_NONPOLYMORPHIC 0x00000020
+#define BCD_HASPCHD 0x00000040 // pClassHierarchyDescriptor field is present
 
 #define COL_SIG_REV0 0
 #define COL_SIG_REV1 1
 
-#define CHD_MULTINH		0x00000001
-#define CHD_VIRTINH		0x00000002
-#define CHD_AMBIGUOUS	0x00000004
+#define CHD_MULTINH 0x00000001
+#define CHD_VIRTINH 0x00000002
+#define CHD_AMBIGUOUS 0x00000004
 
 // rddisasm
 
@@ -127,6 +141,7 @@ namespace Detours {
 	// Namespaces
 	// ----------------------------------------------------------------
 
+	using namespace CallStack;
 	using namespace LDR;
 	using namespace Codec;
 	using namespace Hexadecimal;
@@ -141,13 +156,110 @@ namespace Detours {
 	using namespace Hook;
 
 	// ----------------------------------------------------------------
+	// HARDWARE_HOOK_RECORD
+	// ----------------------------------------------------------------
+
+	typedef struct _HARDWARE_HOOK_RECORD {
+		_HARDWARE_HOOK_RECORD() {
+			m_unThreadID = 0;
+			m_unRegister = HARDWARE_HOOK_REGISTER::REGISTER_DR0;
+			m_pCallBack = nullptr;
+			m_pAddress = nullptr;
+			m_unType = HARDWARE_HOOK_TYPE::TYPE_EXECUTE;
+			m_unSize = 0;
+			m_bPendingRestore.store(false, std::memory_order_relaxed);
+			m_bPendingDeletion.store(false, std::memory_order_relaxed);
+			m_bCancelRestore.store(false, std::memory_order_relaxed);
+		}
+
+		DWORD m_unThreadID;
+		HARDWARE_HOOK_REGISTER m_unRegister;
+		fnHardwareHookCallBack m_pCallBack;
+		void* m_pAddress;
+		HARDWARE_HOOK_TYPE m_unType;
+		unsigned char m_unSize;
+		std::atomic<bool> m_bPendingRestore;
+		std::atomic<bool> m_bPendingDeletion;
+		std::atomic<bool> m_bCancelRestore;
+	} HARDWARE_HOOK_RECORD, *PHARDWARE_HOOK_RECORD;
+
+	// ----------------------------------------------------------------
+	// MEMORY_HOOK_RECORD
+	// ----------------------------------------------------------------
+
+	typedef struct _MEMORY_HOOK_RECORD {
+		_MEMORY_HOOK_RECORD() {
+			m_pCallBack = nullptr;
+			m_pPostCallBack = nullptr;
+			m_pAddress = nullptr;
+			m_unSize = 0;
+			m_unActiveThreads.store(0, std::memory_order_relaxed);
+			m_bPendingDeletion = false;
+			InitializeSRWLock(&m_Lock);
+		}
+
+		fnMemoryHookCallBack m_pCallBack;
+		fnMemoryHookCallBack m_pPostCallBack;
+		void* m_pAddress;
+		size_t m_unSize;
+		std::deque<std::unique_ptr<Page>> m_Pages;
+		std::atomic<DWORD> m_unActiveThreads;
+		bool m_bPendingDeletion;
+		SRWLOCK m_Lock;
+	} MEMORY_HOOK_RECORD, *PMEMORY_HOOK_RECORD;
+
+	// ----------------------------------------------------------------
+	// MEMORY_HOOK_POST_CONTEXT
+	// ----------------------------------------------------------------
+
+	typedef struct _MEMORY_HOOK_POST_CONTEXT {
+		_MEMORY_HOOK_POST_CONTEXT() {
+			m_pRecord = nullptr;
+			m_pExceptionAddress = nullptr;
+			m_pFaultAddress = nullptr;
+			m_unOperation = MEMORY_HOOK_OPERATION::MEMORY_READ;
+		}
+
+		PMEMORY_HOOK_RECORD m_pRecord;
+		void* m_pExceptionAddress;
+		void* m_pFaultAddress;
+		MEMORY_HOOK_OPERATION m_unOperation;
+	} MEMORY_HOOK_POST_CONTEXT, *PMEMORY_HOOK_POST_CONTEXT;
+
+	// ----------------------------------------------------------------
+	// INTERRUPT_HOOK_RECORD
+	// ----------------------------------------------------------------
+
+	typedef struct _INTERRUPT_HOOK_RECORD {
+		_INTERRUPT_HOOK_RECORD() {
+			m_pCallBack = nullptr;
+			m_unInterrupt = 0;
+		}
+
+		fnInterruptHookCallBack m_pCallBack;
+		unsigned char m_unInterrupt;
+	} INTERRUPT_HOOK_RECORD, *PINTERRUPT_HOOK_RECORD;
+
+	// ----------------------------------------------------------------
+	// Locks
+	// ----------------------------------------------------------------
+
+	static SRWLOCK g_HardwareHookRecordsLock = SRWLOCK_INIT;
+	static SRWLOCK g_MemoryHookStacksLock = SRWLOCK_INIT;
+	static SRWLOCK g_MemoryHookRecordsLock = SRWLOCK_INIT;
+
+	// ----------------------------------------------------------------
 	// Storage
 	// ----------------------------------------------------------------
 
-	static std::unordered_map<void*, std::unique_ptr<Protection>> g_Protections;
-	static std::unordered_map<void*, std::unique_ptr<MemoryHook>> g_MemoryHooks;
-	static std::unordered_map<void*, std::unique_ptr<InterruptHook>> g_InterruptHooks;
-	static NearStorage g_HookStorage(HOOK_STORAGE_CAPACITY);
+	static std::unordered_map<DWORD, std::vector<PMEMORY_HOOK_RECORD>> g_MemoryHookOpenedStacks;
+	static std::unordered_map<DWORD, std::vector<MEMORY_HOOK_POST_CONTEXT>> g_MemoryHookPostStacks;
+
+	static std::deque<std::unique_ptr<HARDWARE_HOOK_RECORD>> g_HardwareHookRecords;
+	static std::deque<std::unique_ptr<MEMORY_HOOK_RECORD>> g_MemoryHookRecords;
+	static std::deque<std::unique_ptr<INTERRUPT_HOOK_RECORD>> g_InterruptHookRecords;
+	static MemoryManager g_MemoryManager;
+	static Storage g_HookStorage;
 
 	// ----------------------------------------------------------------
 	// KUSER_SHARED_DATA
@@ -171,12 +283,236 @@ namespace Detours {
 	// TEB
 	// ----------------------------------------------------------------
 
+	enum THREADINFOCLASS {
+		ThreadBasicInformation,
+	};
+
+	typedef struct _THREAD_BASIC_INFORMATION {
+		NTSTATUS ExitStatus;
+		PVOID TebBaseAddress;
+		CLIENT_ID ClientId;
+		KAFFINITY AffinityMask;
+		DWORD Priority;
+		DWORD BasePriority;
+	} THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
+
+	using fnNtQueryInformationThread = LONG(__stdcall*)(HANDLE ThreadHandle, THREADINFOCLASS ThreadInformationClass, PVOID ThreadInformation, ULONG ThreadInformationLength, PULONG ReturnLength);
+
 	PTEB GetTEB() {
 #ifdef _M_X64
 		return reinterpret_cast<PTEB>(__readgsqword(0x30));
 #elif _M_IX86
 		return reinterpret_cast<PTEB>(__readfsdword(0x18));
 #endif
+	}
+
+	PTEB GetTEB(HANDLE hThread) {
+		if (!hThread || (hThread == INVALID_HANDLE_VALUE)) {
+			return nullptr;
+		}
+
+		static fnNtQueryInformationThread NtQueryInformationThread = nullptr;
+		if (!NtQueryInformationThread) {
+			HMODULE hNTDLL = GetModuleHandle(_T("ntdll.dll"));
+			if (!hNTDLL) {
+				return nullptr;
+			}
+
+			NtQueryInformationThread = reinterpret_cast<fnNtQueryInformationThread>(GetProcAddress(hNTDLL, "NtQueryInformationThread"));
+			if (!NtQueryInformationThread) {
+				return nullptr;
+			}
+		}
+
+		THREAD_BASIC_INFORMATION tbi;
+		memset(&tbi, 0, sizeof(tbi));
+
+		if (NtQueryInformationThread(hThread, ThreadBasicInformation, &tbi, sizeof(tbi), nullptr) != 0) {
+			return nullptr;
+		}
+
+		return static_cast<PTEB>(tbi.TebBaseAddress);
+	}
+
+	// ----------------------------------------------------------------
+	// CallStack
+	// ----------------------------------------------------------------
+
+	namespace CallStack {
+
+		// ----------------------------------------------------------------
+		// GetCallStack
+		// ----------------------------------------------------------------
+
+		using fnStackWalk64 = BOOL(__stdcall*)(DWORD MachineType, HANDLE hProcess, HANDLE hThread, LPSTACKFRAME64 StackFrame, PVOID ContextRecord, PREAD_PROCESS_MEMORY_ROUTINE64 ReadMemoryRoutine, PFUNCTION_TABLE_ACCESS_ROUTINE64 FunctionTableAccessRoutine, PGET_MODULE_BASE_ROUTINE64 GetModuleBaseRoutine, PTRANSLATE_ADDRESS_ROUTINE64 TranslateAddress);
+
+		static DWORD64 WINAPI GetModuleBaseByAddress(HANDLE hProcess, DWORD64 unAddress) {
+			MEMORY_BASIC_INFORMATION mbi;
+			if (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(unAddress), &mbi, sizeof(mbi))) {
+				return reinterpret_cast<DWORD64>(mbi.BaseAddress);
+			}
+
+			return 0;
+		}
+
+		std::vector<void*> GetCallStack(HANDLE hThread, size_t unMaxEntries) {
+			std::vector<void*> vecCallStack;
+
+			if (!hThread || (hThread == INVALID_HANDLE_VALUE) || !unMaxEntries) {
+				return vecCallStack;
+			}
+
+			static fnStackWalk64 StackWalk64 = nullptr;
+			if (!StackWalk64) {
+				HMODULE hDbgHelp = GetModuleHandle(_T("DbgHelp.dll"));
+				if (!hDbgHelp) {
+					return vecCallStack;
+				}
+
+				StackWalk64 = reinterpret_cast<fnStackWalk64>(GetProcAddress(hDbgHelp, "StackWalk64"));
+				if (!StackWalk64) {
+					return vecCallStack;
+				}
+			}
+
+			CONTEXT ctx = { 0 };
+			ctx.ContextFlags = CONTEXT_FULL;
+
+			if (!GetThreadContext(hThread, &ctx)) {
+				return vecCallStack;
+			}
+
+			STACKFRAME64 frame = { 0 };
+			DWORD unMachineType = 0;
+
+#ifdef _M_X64
+			unMachineType = IMAGE_FILE_MACHINE_AMD64;
+			frame.AddrPC.Offset = ctx.Rip;
+			frame.AddrFrame.Offset = ctx.Rbp;
+			frame.AddrStack.Offset = ctx.Rsp;
+#elif _M_IX86
+			unMachineType = IMAGE_FILE_MACHINE_I386;
+			frame.AddrPC.Offset = ctx.Eip;
+			frame.AddrFrame.Offset = ctx.Ebp;
+			frame.AddrStack.Offset = ctx.Esp;
+#endif
+
+			frame.AddrPC.Mode = AddrModeFlat;
+			frame.AddrFrame.Mode = AddrModeFlat;
+			frame.AddrStack.Mode = AddrModeFlat;
+
+			for (size_t i = 0; i < unMaxEntries; ++i) {
+				if (!StackWalk64(unMachineType, GetCurrentProcess(), hThread, &frame, &ctx, nullptr, nullptr, GetModuleBaseByAddress, nullptr)) {
+					break;
+				}
+
+				if (!frame.AddrReturn.Offset) {
+					break;
+				}
+
+				vecCallStack.push_back(reinterpret_cast<void*>(frame.AddrReturn.Offset));
+			}
+
+			return vecCallStack;
+		}
+
+		// ----------------------------------------------------------------
+		// GetShadowStack
+		// ----------------------------------------------------------------
+
+		bool GetShadowStack(HANDLE hThread, void*** pShadowStack, size_t* pSize) {
+			if (!hThread || (hThread == INVALID_HANDLE_VALUE)) {
+				return false;
+			}
+
+			if (!(GetEnabledXStateFeatures() & XSTATE_MASK_CET_U)) {
+				return false;
+			}
+
+			DWORD unContextSize = 0;
+#pragma warning(push)
+#pragma warning(disable : 6387)
+			InitializeContext2(nullptr, CONTEXT_XSTATE, nullptr, &unContextSize, XSTATE_MASK_CET_U);
+#pragma warning(pop)
+			if (!unContextSize) {
+				return false;
+			}
+
+			auto pBuffer = std::make_unique<BYTE[]>(unContextSize);
+			if (!pBuffer) {
+				return false;
+			}
+
+			memset(pBuffer.get(), 0, unContextSize);
+
+			PCONTEXT ctx = nullptr;
+			if (!InitializeContext2(pBuffer.get(), CONTEXT_XSTATE, &ctx, &unContextSize, XSTATE_MASK_CET_U)) {
+				return false;
+			}
+
+			if (!GetThreadContext(hThread, ctx)) {
+				return false;
+			}
+
+			DWORD64 unFeatureMask = 0;
+			if (!GetXStateFeaturesMask(ctx, &unFeatureMask)) {
+				return false;
+			}
+
+			if (!(unFeatureMask & XSTATE_MASK_CET_U)) {
+				return false;
+			}
+
+			DWORD unCETSize = 0;
+			auto pCET = reinterpret_cast<PXSAVE_CET_U_FORMAT>(LocateXStateFeature(ctx, XSTATE_CET_U, &unCETSize));
+			if (!pCET) {
+				return false;
+			}
+
+			if (!pCET->Ia32Pl3SspMsr) {
+				return false;
+			}
+
+			MEMORY_BASIC_INFORMATION mbi;
+			if (!VirtualQuery(reinterpret_cast<void**>(pCET->Ia32Pl3SspMsr), &mbi, sizeof(mbi))) {
+				return false;
+			}
+
+			if (pShadowStack) {
+				*pShadowStack = reinterpret_cast<void**>(pCET->Ia32Pl3SspMsr);
+			}
+
+			if (pSize) {
+				*pSize = (reinterpret_cast<size_t>(mbi.BaseAddress) + mbi.RegionSize - static_cast<size_t>(pCET->Ia32Pl3SspMsr)) / sizeof(void*);
+			}
+
+			return true;
+		}
+
+		// ----------------------------------------------------------------
+		// GetShadowCallStack
+		// ----------------------------------------------------------------
+
+		std::vector<void*> GetShadowCallStack(HANDLE hThread, size_t unMaxEntries) {
+			std::vector<void*> vecCallStack;
+
+			if (!hThread || (hThread == INVALID_HANDLE_VALUE)) {
+				return vecCallStack;
+			}
+
+			void** pShadowStack = nullptr;
+			size_t unShadowStackSize = 0;
+			if (!GetShadowStack(hThread, &pShadowStack, &unShadowStackSize)) {
+				return vecCallStack;
+			}
+
+			size_t unEntries = MIN(unShadowStackSize, unMaxEntries);
+			for (size_t i = 0; i < unEntries; ++i) {
+				vecCallStack.push_back(pShadowStack[i]);
+			}
+
+			return vecCallStack;
+		}
 	}
 
 	// ----------------------------------------------------------------
@@ -189,111 +525,16 @@ namespace Detours {
 		// List Entry APIs
 		// ----------------------------------------------------------------
 
-		void InitializeListHead(PLIST_ENTRY pListHead) {
-			if (pListHead) {
-				pListHead->Flink = pListHead->Blink = pListHead;
-			}
+		void UnLinkEntry(PLIST_ENTRY pEntry) {
+			pEntry->Flink->Blink = pEntry->Blink;
+			pEntry->Blink->Flink = pEntry->Flink;
 		}
 
-		void InsertEntry(PLIST_ENTRY pPrev, PLIST_ENTRY pNext, PLIST_ENTRY pEntry) {
-			if (pPrev && pNext && pEntry) {
-				pEntry->Flink = pNext;
-				pEntry->Blink = pPrev;
-
-				if (pPrev->Flink) {
-					pPrev->Flink->Blink = pEntry;
-				}
-
-				if (pNext->Blink) {
-					pNext->Blink->Flink = pEntry;
-				}
-
-				pPrev->Flink = pEntry;
-				pNext->Blink = pEntry;
-			}
-		}
-
-		void InsertHeadList(PLIST_ENTRY pListHead, PLIST_ENTRY pEntry) {
-			if (pListHead && pEntry) {
-				InsertEntry(pListHead, pListHead->Flink, pEntry);
-			}
-		}
-
-		void InsertTailList(PLIST_ENTRY pListHead, PLIST_ENTRY pEntry) {
-			if (pListHead && pEntry) {
-				InsertEntry(pListHead->Blink, pListHead, pEntry);
-			}
-		}
-
-		void RemoveEntryList(PLIST_ENTRY pEntry) {
-			if (pEntry) {
-				PLIST_ENTRY pPrev = pEntry->Blink;
-				PLIST_ENTRY pNext = pEntry->Flink;
-
-				if (pPrev->Flink) {
-					pPrev->Flink = pNext;
-				}
-
-				if (pNext->Blink) {
-					pNext->Blink = pPrev;
-				}
-			}
-		}
-
-		void RemoveHeadList(PLIST_ENTRY pListHead) {
-			if (pListHead && pListHead->Flink) {
-				RemoveEntryList(pListHead->Flink);
-			}
-		}
-
-		void RemoveTailList(PLIST_ENTRY pListHead) {
-			if (pListHead && pListHead->Blink) {
-				RemoveEntryList(pListHead->Blink);
-			}
-		}
-
-		PLIST_ENTRY GetListHeadFromEntry(PLIST_ENTRY pEntry) {
-			if (!pEntry) {
-				return nullptr;
-			}
-
-			PLIST_ENTRY pHead = pEntry;
-
-			while ((pHead->Blink != nullptr) && (pHead->Blink != pEntry)) {
-				pHead = pHead->Blink;
-			}
-
-			return pEntry;
-		}
-
-		// ----------------------------------------------------------------
-		// GetListHeads
-		// ----------------------------------------------------------------
-
-		bool GetHeadsOfLists(PLIST_ENTRY* pInLoadOrderModuleList, PLIST_ENTRY* pInMemoryOrderModuleList, PLIST_ENTRY* pInInitializationOrderModuleList) {
-			auto pPEB = GetPEB();
-			if (!pPEB) {
-				return false;
-			}
-
-			auto pLDR = pPEB->Ldr;
-			if (!pLDR) {
-				return false;
-			}
-
-			if (pInLoadOrderModuleList) {
-				*pInLoadOrderModuleList = &pLDR->InLoadOrderModuleList;
-			}
-
-			if (pInMemoryOrderModuleList) {
-				*pInMemoryOrderModuleList = &pLDR->InMemoryOrderModuleList;
-			}
-
-			if (pInInitializationOrderModuleList) {
-				*pInInitializationOrderModuleList = &pLDR->InInitializationOrderModuleList;
-			}
-
-			return true;
+		void ReLinkEntry(PLIST_ENTRY pList, PLIST_ENTRY pEntry) {
+			pList->Flink->Blink = pEntry;
+			pList->Blink->Flink = pEntry;
+			pEntry->Blink = pList->Blink;
+			pEntry->Flink = pList->Flink;
 		}
 
 		// ----------------------------------------------------------------
@@ -305,54 +546,26 @@ namespace Detours {
 				return nullptr;
 			}
 
-			PLIST_ENTRY pInLoadOrderModuleList = nullptr;
-			PLIST_ENTRY pInMemoryOrderModuleList = nullptr;
-			PLIST_ENTRY pInInitializationOrderModuleList = nullptr;
-
-			if (!GetHeadsOfLists(&pInLoadOrderModuleList, &pInMemoryOrderModuleList, &pInInitializationOrderModuleList)) {
+			auto pPEB = GetPEB();
+			if (!pPEB) {
 				return nullptr;
 			}
 
-			if (pInLoadOrderModuleList) {
-				PLIST_ENTRY pHead = pInLoadOrderModuleList;
-				PLIST_ENTRY pEntry = pInLoadOrderModuleList->Flink;
-				while (pEntry != pHead) {
-					auto pDTE = CONTAINING_RECORD(pEntry, Detours::LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-
-					if (pDTE->DllBase == pBaseAddress) {
-						return pEntry;
-					}
-
-					pEntry = pEntry->Flink;
-				}
+			auto pLDR = pPEB->Ldr;
+			if (!pLDR) {
+				return nullptr;
 			}
 
-			if (pInMemoryOrderModuleList) {
-				PLIST_ENTRY pHead = pInMemoryOrderModuleList;
-				PLIST_ENTRY pEntry = pInMemoryOrderModuleList->Flink;
-				while (pEntry != pHead) {
-					auto pDTE = CONTAINING_RECORD(pEntry, Detours::LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+			PLIST_ENTRY pHead = &pLDR->InLoadOrderModuleList;
+			PLIST_ENTRY pEntry = pHead->Flink;
+			while (pEntry != pHead) {
+				auto pDTE = CONTAINING_RECORD(pEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
 
-					if (pDTE->DllBase == pBaseAddress) {
-						return pEntry;
-					}
-
-					pEntry = pEntry->Flink;
+				if (pDTE->DllBase == pBaseAddress) {
+					return pEntry;
 				}
-			}
 
-			if (pInInitializationOrderModuleList) {
-				PLIST_ENTRY pHead = pInInitializationOrderModuleList;
-				PLIST_ENTRY pEntry = pInInitializationOrderModuleList->Flink;
-				while (pEntry != pHead) {
-					auto pDTE = CONTAINING_RECORD(pEntry, Detours::LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks);
-
-					if (pDTE->DllBase == pBaseAddress) {
-						return pEntry;
-					}
-
-					pEntry = pEntry->Flink;
-				}
+				pEntry = pEntry->Flink;
 			}
 
 			return nullptr;
@@ -416,7 +629,7 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return CONTAINING_RECORD(pEntry, Detours::LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+			return CONTAINING_RECORD(pEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
 		}
 
 		PLDR_DATA_TABLE_ENTRY FindModuleDataTableEntry(HMODULE hModule) {
@@ -467,6 +680,29 @@ namespace Detours {
 		// UnLinkModule
 		// ----------------------------------------------------------------
 
+		bool UnLinkModule(PLDR_DATA_TABLE_ENTRY pDTE, PLINK_DATA pLinkData) {
+			if (!pDTE || !pLinkData) {
+				return false;
+			}
+
+			memset(pLinkData, 0, sizeof(LINK_DATA));
+
+			pLinkData->m_pDTE = pDTE;
+			pLinkData->m_pSavedInLoadOrderLinks = pDTE->InLoadOrderLinks.Blink->Flink;
+			pLinkData->m_pSavedInInitializationOrderLinks = pDTE->InInitializationOrderLinks.Blink->Flink;
+			pLinkData->m_pSavedInMemoryOrderLinks = pDTE->InMemoryOrderLinks.Blink->Flink;
+			pLinkData->m_pSavedHashLinks = pDTE->HashLinks.Blink->Flink;
+			pLinkData->m_pSavedNodeModuleLink = pDTE->NodeModuleLink.Blink->Flink;
+
+			UnLinkEntry(&pDTE->InLoadOrderLinks);
+			UnLinkEntry(&pDTE->InInitializationOrderLinks);
+			UnLinkEntry(&pDTE->InMemoryOrderLinks);
+			UnLinkEntry(&pDTE->HashLinks);
+			UnLinkEntry(&pDTE->NodeModuleLink);
+
+			return true;
+		}
+
 		bool UnLinkModule(void* pBaseAddress, PLINK_DATA pLinkData) {
 			if (!pBaseAddress || !pLinkData) {
 				return false;
@@ -474,50 +710,23 @@ namespace Detours {
 
 			memset(pLinkData, 0, sizeof(LINK_DATA));
 
-			auto pDTE = Detours::LDR::FindModuleDataTableEntry(pBaseAddress);
+			auto pDTE = FindModuleDataTableEntry(pBaseAddress);
 			if (!pDTE) {
 				return false;
 			}
 
-			PLIST_ENTRY pInLoadOrderModuleList = nullptr;
-			PLIST_ENTRY pInMemoryOrderModuleList = nullptr;
-			PLIST_ENTRY pInInitializationOrderModuleList = nullptr;
+			pLinkData->m_pDTE = pDTE;
+			pLinkData->m_pSavedInLoadOrderLinks = pDTE->InLoadOrderLinks.Blink->Flink;
+			pLinkData->m_pSavedInInitializationOrderLinks = pDTE->InInitializationOrderLinks.Blink->Flink;
+			pLinkData->m_pSavedInMemoryOrderLinks = pDTE->InMemoryOrderLinks.Blink->Flink;
+			pLinkData->m_pSavedHashLinks = pDTE->HashLinks.Blink->Flink;
+			pLinkData->m_pSavedNodeModuleLink = pDTE->NodeModuleLink.Blink->Flink;
 
-			if (!GetHeadsOfLists(&pInLoadOrderModuleList, &pInMemoryOrderModuleList, &pInInitializationOrderModuleList)) {
-				return false;
-			}
-
-			pLinkData->m_pHeadInLoadOrderLinks = pInLoadOrderModuleList;
-			pLinkData->m_pHeadInMemoryOrderLinks = pInMemoryOrderModuleList;
-			pLinkData->m_pHeadInInitializationOrderLinks = pInInitializationOrderModuleList;
-
-			pLinkData->m_pHeadHashLinks = GetListHeadFromEntry(&pDTE->HashLinks);
-			pLinkData->m_pHeadNodeModuleLink = GetListHeadFromEntry(&pDTE->NodeModuleLink);
-
-			if (pLinkData->m_pHeadInLoadOrderLinks) {
-				Detours::LDR::RemoveEntryList(&pDTE->InLoadOrderLinks);
-				pLinkData->m_pSavedInLoadOrderLinks = &pDTE->InLoadOrderLinks;
-			}
-
-			if (pLinkData->m_pHeadInMemoryOrderLinks) {
-				Detours::LDR::RemoveEntryList(&pDTE->InMemoryOrderLinks);
-				pLinkData->m_pSavedInMemoryOrderLinks = &pDTE->InMemoryOrderLinks;
-			}
-
-			if (pLinkData->m_pHeadInInitializationOrderLinks) {
-				Detours::LDR::RemoveEntryList(&pDTE->InInitializationOrderLinks);
-				pLinkData->m_pSavedInInitializationOrderLinks = &pDTE->InInitializationOrderLinks;
-			}
-
-			if (pLinkData->m_pHeadHashLinks) {
-				Detours::LDR::RemoveEntryList(&pDTE->HashLinks);
-				pLinkData->m_pSavedHashLinks = &pDTE->HashLinks;
-			}
-
-			if (pLinkData->m_pHeadNodeModuleLink) {
-				Detours::LDR::RemoveEntryList(&pDTE->NodeModuleLink);
-				pLinkData->m_pSavedNodeModuleLink = &pDTE->NodeModuleLink;
-			}
+			UnLinkEntry(&pDTE->InLoadOrderLinks);
+			UnLinkEntry(&pDTE->InInitializationOrderLinks);
+			UnLinkEntry(&pDTE->InMemoryOrderLinks);
+			UnLinkEntry(&pDTE->HashLinks);
+			UnLinkEntry(&pDTE->NodeModuleLink);
 
 			return true;
 		}
@@ -565,58 +774,12 @@ namespace Detours {
 		// ReLinkModule
 		// ----------------------------------------------------------------
 
-		bool ReLinkModule(LINK_DATA LinkData) {
-			if (LinkData.m_pSavedInLoadOrderLinks) {
-				if (!LinkData.m_pHeadInLoadOrderLinks) {
-					return false;
-				}
-			}
-
-			if (LinkData.m_pSavedInMemoryOrderLinks) {
-				if (!LinkData.m_pHeadInMemoryOrderLinks) {
-					return false;
-				}
-			}
-	
-			if (LinkData.m_pSavedInInitializationOrderLinks) {
-				if (!LinkData.m_pHeadInInitializationOrderLinks) {
-					return false;
-				}
-			}
-
-			if (LinkData.m_pSavedHashLinks) {
-				if (!LinkData.m_pHeadHashLinks) {
-					return false;
-				}
-			}
-
-			if (LinkData.m_pSavedNodeModuleLink) {
-				if (!LinkData.m_pHeadNodeModuleLink) {
-					return false;
-				}
-			}
-
-			if (LinkData.m_pSavedInLoadOrderLinks) {
-				Detours::LDR::InsertTailList(LinkData.m_pHeadInLoadOrderLinks, LinkData.m_pSavedInLoadOrderLinks);
-			}
-
-			if (LinkData.m_pSavedInMemoryOrderLinks) {
-				Detours::LDR::InsertTailList(LinkData.m_pHeadInMemoryOrderLinks, LinkData.m_pSavedInMemoryOrderLinks);
-			}
-
-			if (LinkData.m_pSavedInInitializationOrderLinks) {
-				Detours::LDR::InsertTailList(LinkData.m_pHeadInInitializationOrderLinks, LinkData.m_pSavedInInitializationOrderLinks);
-			}
-
-			if (LinkData.m_pSavedHashLinks) {
-				Detours::LDR::InsertTailList(LinkData.m_pHeadHashLinks, LinkData.m_pSavedHashLinks);
-			}
-
-			if (LinkData.m_pSavedNodeModuleLink) {
-				Detours::LDR::InsertTailList(LinkData.m_pHeadNodeModuleLink, LinkData.m_pSavedNodeModuleLink);
-			}
-
-			return true;
+		void ReLinkModule(LINK_DATA LinkData) {
+			ReLinkEntry(&LinkData.m_pDTE->InLoadOrderLinks, LinkData.m_pSavedInLoadOrderLinks);
+			ReLinkEntry(&LinkData.m_pDTE->InInitializationOrderLinks, LinkData.m_pSavedInInitializationOrderLinks);
+			ReLinkEntry(&LinkData.m_pDTE->InMemoryOrderLinks, LinkData.m_pSavedInMemoryOrderLinks);
+			ReLinkEntry(&LinkData.m_pDTE->HashLinks, LinkData.m_pSavedHashLinks);
+			ReLinkEntry(&LinkData.m_pDTE->NodeModuleLink, LinkData.m_pSavedNodeModuleLink);
 		}
 	}
 
@@ -625,6 +788,46 @@ namespace Detours {
 	// ----------------------------------------------------------------
 
 	namespace Codec {
+
+		// ----------------------------------------------------------------
+		// UpperCase
+		// ----------------------------------------------------------------
+
+		bool UpperCase(char szBuffer[], const size_t unSize) {
+			if (!szBuffer || !unSize) {
+				return false;
+			}
+
+			for (size_t i = 0; i < unSize; ++i) {
+				const unsigned char unX = szBuffer[i];
+
+				if ((unX >= 'a') && (unX <= 'z')) {
+					szBuffer[i] = unX & ~0x20;
+				}
+			}
+
+			return true;
+		}
+
+		// ----------------------------------------------------------------
+		// LowerCase
+		// ----------------------------------------------------------------
+
+		bool LowerCase(char szBuffer[], const size_t unSize) {
+			if (!szBuffer || !unSize) {
+				return false;
+			}
+
+			for (size_t i = 0; i < unSize; ++i) {
+				const unsigned char unX = szBuffer[i];
+
+				if ((unX >= 'A') && (unX <= 'Z')) {
+					szBuffer[i] = unX | 0x20;
+				}
+			}
+
+			return true;
+		}
 
 		// ----------------------------------------------------------------
 		// Encode
@@ -1042,8 +1245,14 @@ namespace Detours {
 			char m_pName[1];
 		} IMAGE_POGO_BLOCK, *PIMAGE_POGO_BLOCK;
 
+		// 0x4C544347 - 'LTCG'
+		// 0x50474900 - 'PGI\x00'
+		// 0x50474F00 - 'PGO\x00'
+		// 0x50475500 - 'PGU\x00'
+		// 0x5350474F - 'SPGO'
+
 		typedef struct _IMAGE_POGO_INFO {
-			DWORD m_Signature; // 0x4C544347 = 'LTCG'
+			DWORD m_unSignature;
 			IMAGE_POGO_BLOCK m_pBlocks[1];
 		} IMAGE_POGO_INFO, *PIMAGE_POGO_INFO;
 
@@ -1068,19 +1277,23 @@ namespace Detours {
 				}
 
 				const auto& pPI = reinterpret_cast<PIMAGE_POGO_INFO>(reinterpret_cast<char*>(hModule) + pDebugDirectory[i].AddressOfRawData);
-				if (pPI->m_Signature != 0x4C544347) {
+				if ((pPI->m_unSignature != 0x4C544347) && (pPI->m_unSignature != 0x50474900) && (pPI->m_unSignature != 0x50474F00) && (pPI->m_unSignature != 0x50475500) && (pPI->m_unSignature != 0x5350474F)) {
 					continue;
 				}
 
 				PIMAGE_POGO_BLOCK pBlock = pPI->m_pBlocks;
 				while (pBlock->m_unRVA != 0) {
-					const size_t unNameLength = strnlen_s(pBlock->m_pName, 0x1000) + 1; // FIXME: Unsafe.
-					size_t unBlockSize = sizeof(DWORD) * 2 + unNameLength;
+					const size_t unNameLength = strnlen_s(pBlock->m_pName, 0x7FF);
+					if (unNameLength == 0x7FF) {
+						break;
+					}
+
+					size_t unBlockSize = sizeof(DWORD) * 2 + unNameLength + 1;
 					if (unBlockSize & 3) {
 						unBlockSize += (4 - (unBlockSize & 3));
 					}
 
-					if (strncmp(szSectionName, pBlock->m_pName, 0x1000) == 0) { // FIXME: Unsafe.
+					if (strncmp(szSectionName, pBlock->m_pName, 0x7FF) == 0) {
 						if (pAddress) {
 							*pAddress = reinterpret_cast<void*>(reinterpret_cast<char*>(hModule) + pBlock->m_unRVA);
 						}
@@ -1136,114 +1349,81 @@ namespace Detours {
 #endif
 
 		// ----------------------------------------------------------------
-		// Adler32
-		// ----------------------------------------------------------------
-
-		static unsigned int Adler32(unsigned char* pData, size_t unSize) noexcept {
-			const unsigned int MOD_ADLER = 65521;
-			unsigned int unA = 1;
-			unsigned int unB = 0;
-
-			for (size_t i = 0; i < unSize; ++i) {
-				unA = (unA + pData[i]) % MOD_ADLER;
-				unB = (unB + unA) % MOD_ADLER;
-			}
-
-			return (unB << 16) | unA;
-		};
-
-		// ----------------------------------------------------------------
-		// CheckSignatureHash
-		// ----------------------------------------------------------------
-
-		static bool CheckSignatureHash(void const* const pAddress, const unsigned int unHash) noexcept {
-			const unsigned short unFunctionSize = unHash & 0xFFFF;
-			const unsigned short unFunctionHash = unHash >> 16;
-
-			auto pSignatureBytes = std::make_unique<unsigned char[]>(unFunctionSize);
-			if (!pSignatureBytes) {
-				return false;
-			}
-
-			INSTRUCTION ins;
-			size_t unSignatureIndex = 0;
-			size_t unFunctionIndex = 0;
-			while (unFunctionIndex < unFunctionSize) {
-#ifdef _M_X64
-				if (!RD_SUCCESS(RdDecode(&ins, reinterpret_cast<unsigned char*>(const_cast<void*>(pAddress)) + unFunctionIndex, RD_CODE_64, RD_DATA_64))) {
-#elif _M_IX86
-				if (!RD_SUCCESS(RdDecode(&ins, reinterpret_cast<unsigned char*>(const_cast<void*>(pAddress)) + unFunctionIndex, RD_CODE_32, RD_DATA_32))) {
-#endif
-					return false;
-				}
-
-				const unsigned char unInstructionLength = ins.Length;
-				const unsigned char unInstructionSize = unInstructionLength - ins.AddrLength - ins.DispLength - ins.Imm1Length - ins.Imm2Length - ins.Imm3Length - ins.MoffsetLength - ins.RelOffsLength;
-				for (unsigned char i = 0; i < unInstructionSize; ++i) {
-					pSignatureBytes[unSignatureIndex] = ins.InstructionBytes[i];
-					++unSignatureIndex;
-				}
-
-				unFunctionIndex += unInstructionLength;
-			}
-
-			const unsigned int unCalculatedHash = Adler32(pSignatureBytes.get(), unSignatureIndex);
-			if ((unCalculatedHash >> 16) != unFunctionHash) {
-				return false;
-			}
-
-			return true;
-		}
-
-		// ----------------------------------------------------------------
 		// FindSignature (Native)
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureNative(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNative(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!pAddress || !unSize || !szSignature) {
 				return nullptr;
 			}
 
 			const size_t unSignatureLength = strnlen_s(szSignature, 0x1000);
-			if (!unSignatureLength || (unSize <= unSignatureLength)) {
+			if (unSignatureLength == 0 || unSize < unSignatureLength) {
 				return nullptr;
 			}
 
-			unsigned char const* const pData = static_cast<unsigned char const*>(pAddress);
+			unsigned char const* const pData = static_cast<unsigned char const* const>(pAddress);
 			unsigned char const* const pSignature = reinterpret_cast<unsigned char const* const>(szSignature);
 
-			for (size_t unIndex = 0; unIndex <= unSize - unSignatureLength; ++unIndex) {
-				if ((pData[unIndex] != pSignature[0]) && (pSignature[0] != unIgnoredByte)) {
-					continue;
+			ptrdiff_t unAnchorIndex = -1;
+			unsigned char unAnchorValue = 0;
+
+			for (ptrdiff_t i = static_cast<ptrdiff_t>(unSignatureLength) - 1; i >= 0; --i) {
+				const unsigned char unByte = pSignature[static_cast<size_t>(i)];
+				if (unByte != unIgnoredByte) {
+					unAnchorIndex = i;
+					unAnchorValue = unByte;
+					break;
+				}
+			}
+
+			if (unAnchorIndex < 0) {
+				return pData + unOffset;
+			}
+
+			unsigned char const* pScanBegin = pData + static_cast<size_t>(unAnchorIndex);
+			size_t unScanCount = unSize - unSignatureLength + 1;
+			while (unScanCount) {
+				unsigned char const* const pAnchor = static_cast<unsigned char const*>(memchr(pScanBegin, unAnchorValue, unScanCount));
+				if (!pAnchor) {
+					break;
 				}
 
-				size_t unSignatureIndex = 1;
-				for (; unSignatureIndex < unSignatureLength; ++unSignatureIndex) {
-					const unsigned char unSignatureByte = pSignature[unSignatureIndex];
-					if (unSignatureByte == unIgnoredByte) {
-						continue;
-					}
+				const size_t unBase = static_cast<size_t>(pAnchor - pData) - static_cast<size_t>(unAnchorIndex);
 
-					if (pData[unIndex + unSignatureIndex] != unSignatureByte) {
+				bool bMatched = true;
+
+				for (size_t i = 0; i < static_cast<size_t>(unAnchorIndex); ++i) {
+					const unsigned char unByte = pSignature[i];
+					if ((unByte != unIgnoredByte) && (pData[unBase + i] != unByte)) {
+						bMatched = false;
 						break;
 					}
 				}
 
-				if (unSignatureIndex == unSignatureLength) {
-					unsigned char const* const pFoundAddress = pData + unIndex;
-
-					if (unHash && !CheckSignatureHash(pFoundAddress, unHash)) {
-						return nullptr;
+				if (bMatched) {
+					for (size_t i = static_cast<size_t>(unAnchorIndex) + 1; i < unSignatureLength; ++i) {
+						const unsigned char unByte = pSignature[i];
+						if ((unByte != unIgnoredByte) && (pData[unBase + i] != unByte)) {
+							bMatched = false;
+							break;
+						}
 					}
-
-					return pFoundAddress + unOffset;
 				}
+
+				if (bMatched) {
+					return pData + unBase + unOffset;
+				}
+
+				const size_t unAdvance = static_cast<size_t>((pAnchor + 1) - pScanBegin);
+				pScanBegin += unAdvance;
+				unScanCount -= unAdvance;
 			}
 
 			return nullptr;
 		}
 
-		void const* FindSignatureNative(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNative(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1252,10 +1432,10 @@ namespace Detours {
 			const auto& pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(hModule) + pDH->e_lfanew);
 			const auto& pOH = &(pNTHs->OptionalHeader);
 
-			return FindSignatureNative(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNative(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNative(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1266,10 +1446,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNative(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNative(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1280,10 +1460,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1293,10 +1473,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNativeA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNativeA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1306,10 +1486,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1319,10 +1499,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1332,10 +1512,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNativeW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNativeW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1345,10 +1525,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1358,32 +1538,32 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureNative(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureNative(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
 #ifdef _UNICODE
-		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureNativeW(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureNativeW(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNative(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureNativeW(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureNative(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureNativeW(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureNativeW(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureNativeW(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #else
-		void const* FindSignatureNative(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureNativeA(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureNative(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureNativeA(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNative(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureNativeA(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureNative(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureNativeA(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureNative(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureNativeA(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureNative(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureNativeA(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #endif
 
@@ -1391,7 +1571,7 @@ namespace Detours {
 		// FindSignature (SSE2)
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureSSE2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!pAddress || !unSize || !szSignature) {
 				return nullptr;
 			}
@@ -1404,17 +1584,25 @@ namespace Detours {
 			unsigned char const* const pData = static_cast<unsigned char const* const>(pAddress);
 			unsigned char const* const pSignature = reinterpret_cast<unsigned char const* const>(szSignature);
 
-			const size_t unDataBytesCycles = unSize / 16;
+			const size_t unLastStart = unSize - unSignatureLength;
+			if (unLastStart < 15) {
+				return FindSignatureNative(pData, unSize, szSignature, unIgnoredByte, unOffset);
+			}
+
+			const size_t unEnd = unLastStart - 15;
+			const size_t unEndAligned = (unEnd & ~static_cast<size_t>(15));
+			const size_t unDataBytesCycles = (unEndAligned / 16) + 1;
+
 			for (size_t unCycle = 0; unCycle < unDataBytesCycles; ++unCycle) {
 				const size_t unCycleOffset = unCycle * 16;
 
-				if ((unCycle != 0) && ((unCycle + 1) <= unDataBytesCycles)) {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset + 16), _MM_HINT_T0);
-				} else {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset), _MM_HINT_T0);
+				const size_t unPrefect = unCycleOffset + 64;
+				if (unPrefect < unSize) {
+					_mm_prefetch(reinterpret_cast<char const* const>(pData + unPrefect), _MM_HINT_T0);
 				}
 
-				unsigned __int16 unFound = 0xFFFFui16;
+				unsigned __int16 unFound = 0xFFFF;
+
 				for (size_t unSignatureIndex = 0; (unSignatureIndex < unSignatureLength) && (unFound != 0); ++unSignatureIndex) {
 					const unsigned char unSignatureByte = pSignature[unSignatureIndex];
 					if (unSignatureByte == unIgnoredByte) {
@@ -1423,36 +1611,31 @@ namespace Detours {
 
 					const __m128i xmm1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pData + unCycleOffset + unSignatureIndex));
 					const __m128i xmm2 = _mm_set1_epi8(static_cast<char>(unSignatureByte));
-
 					const __m128i xmm3 = _mm_cmpeq_epi8(xmm1, xmm2);
 
-					unFound &= _mm_movemask_epi8(xmm3);
+					unFound &= static_cast<unsigned __int16>(_mm_movemask_epi8(xmm3));
 				}
 
 				if (unFound != 0) {
-					unsigned char const* const pFoundAddress = pData + unCycleOffset + __bit_scan_forward(unFound);
+					const size_t unBitIndex = static_cast<size_t>(__bit_scan_forward(unFound));
+					const size_t unStartIndex = unCycleOffset + unBitIndex;
 
-					if (unHash && !CheckSignatureHash(pFoundAddress, unHash)) {
-						return nullptr;
-					}
-
+					unsigned char const* const pFoundAddress = pData + unStartIndex;
 					return pFoundAddress + unOffset;
 				}
 			}
 
-			const size_t unDataBytesLeft = unSize & 0xF;
-			if (unDataBytesLeft) {
-				if (unDataBytesLeft < unSignatureLength) {
-					return FindSignatureNative(pData + unSize - unDataBytesLeft - unSignatureLength, unDataBytesLeft + unSignatureLength, szSignature, unIgnoredByte, unOffset, unHash);
-				}
-
-				return FindSignatureNative(pData + unSize - unDataBytesLeft, unDataBytesLeft, szSignature, unIgnoredByte, unOffset, unHash);
+			const size_t unCoveredEnd = unEndAligned + 15;
+			if (unCoveredEnd < unLastStart) {
+				unsigned char const* const pTail = pData + (unCoveredEnd + 1);
+				const size_t unTailSize = unSize - (unCoveredEnd + 1);
+				return FindSignatureNative(pTail, unTailSize, szSignature, unIgnoredByte, unOffset);
 			}
 
 			return nullptr;
 		}
 
-		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1461,10 +1644,10 @@ namespace Detours {
 			const auto& pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(hModule) + pDH->e_lfanew);
 			const auto& pOH = &(pNTHs->OptionalHeader);
 
-			return FindSignatureSSE2(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1475,10 +1658,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1489,10 +1672,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1502,10 +1685,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1515,10 +1698,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1528,10 +1711,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1541,10 +1724,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1554,10 +1737,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1567,32 +1750,32 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureSSE2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureSSE2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
 #ifdef _UNICODE
-		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureSSE2W(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureSSE2W(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureSSE2W(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureSSE2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureSSE2W(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureSSE2W(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureSSE2W(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #else
-		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureSSE2A(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureSSE2A(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureSSE2A(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureSSE2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureSSE2A(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureSSE2A(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureSSE2A(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #endif
 
@@ -1600,7 +1783,7 @@ namespace Detours {
 		// FindSignature (AVX2)
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureAVX2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!pAddress || !unSize || !szSignature) {
 				return nullptr;
 			}
@@ -1613,17 +1796,25 @@ namespace Detours {
 			unsigned char const* const pData = static_cast<unsigned char const* const>(pAddress);
 			unsigned char const* const pSignature = reinterpret_cast<unsigned char const* const>(szSignature);
 
-			const size_t unDataBytesCycles = unSize / 32;
+			const size_t unLastStart = unSize - unSignatureLength;
+			if (unLastStart < 31) {
+				return FindSignatureSSE2(pData, unSize, szSignature, unIgnoredByte, unOffset);
+			}
+
+			const size_t unEnd = unLastStart - 31;
+			const size_t unEndAligned = (unEnd & ~static_cast<size_t>(31));
+			const size_t unDataBytesCycles = (unEndAligned / 32) + 1;
+
 			for (size_t unCycle = 0; unCycle < unDataBytesCycles; ++unCycle) {
 				const size_t unCycleOffset = unCycle * 32;
 
-				if ((unCycle != 0) && ((unCycle + 1) <= unDataBytesCycles)) {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset + 32), _MM_HINT_T0);
-				} else {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset), _MM_HINT_T0);
+				const size_t unPrefetch = unCycleOffset + 64;
+				if (unPrefetch < unSize) {
+					_mm_prefetch(reinterpret_cast<char const* const>(pData + unPrefetch), _MM_HINT_T0);
 				}
 
-				unsigned __int32 unFound = 0xFFFFFFFFui32;
+				unsigned __int32 unFound = 0xFFFFFFFF;
+
 				for (size_t unSignatureIndex = 0; (unSignatureIndex < unSignatureLength) && (unFound != 0); ++unSignatureIndex) {
 					const unsigned char unSignatureByte = pSignature[unSignatureIndex];
 					if (unSignatureByte == unIgnoredByte) {
@@ -1632,36 +1823,31 @@ namespace Detours {
 
 					const __m256i ymm0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pData + unCycleOffset + unSignatureIndex));
 					const __m256i ymm1 = _mm256_set1_epi8(static_cast<char>(unSignatureByte));
-
 					const __m256i ymm3 = _mm256_cmpeq_epi8(ymm0, ymm1);
 
-					unFound &= _mm256_movemask_epi8(ymm3);
+					unFound &= static_cast<unsigned __int32>(_mm256_movemask_epi8(ymm3));
 				}
 
 				if (unFound != 0) {
-					unsigned char const* const pFoundAddress = pData + unCycleOffset + __bit_scan_forward(unFound);
+					const size_t unBitIndex = static_cast<size_t>(__bit_scan_forward(unFound));
+					const size_t unStartIndex = unCycleOffset + unBitIndex;
 
-					if (unHash && !CheckSignatureHash(pFoundAddress, unHash)) {
-						return nullptr;
-					}
-
+					unsigned char const* const pFoundAddress = pData + unStartIndex;
 					return pFoundAddress + unOffset;
 				}
 			}
 
-			const size_t unDataBytesLeft = unSize & 0x1F;
-			if (unDataBytesLeft) {
-				if (unDataBytesLeft < unSignatureLength) {
-					return FindSignatureSSE2(pData + unSize - unDataBytesLeft - unSignatureLength, unDataBytesLeft + unSignatureLength, szSignature, unIgnoredByte, unOffset, unHash);
-				}
-
-				return FindSignatureSSE2(pData + unSize - unDataBytesLeft, unDataBytesLeft, szSignature, unIgnoredByte, unOffset, unHash);
+			const size_t unCoveredEnd = unEndAligned + 31;
+			if (unCoveredEnd < unLastStart) {
+				unsigned char const* const pTail = pData + (unCoveredEnd + 1);
+				const size_t unTailSize = unSize - (unCoveredEnd + 1);
+				return FindSignatureSSE2(pTail, unTailSize, szSignature, unIgnoredByte, unOffset);
 			}
 
 			return nullptr;
 		}
 
-		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1670,10 +1856,10 @@ namespace Detours {
 			const auto& pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(hModule) + pDH->e_lfanew);
 			const auto& pOH = &(pNTHs->OptionalHeader);
 
-			return FindSignatureAVX2(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1684,10 +1870,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1698,10 +1884,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1711,10 +1897,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1724,10 +1910,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1737,10 +1923,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1750,10 +1936,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1763,10 +1949,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1776,32 +1962,32 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX2(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
 #ifdef _UNICODE
-		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX2W(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX2W(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX2W(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX2W(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX2W(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX2W(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #else
-		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX2A(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX2A(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX2A(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX2A(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX2A(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX2A(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #endif
 
@@ -1809,7 +1995,7 @@ namespace Detours {
 		// FindSignature (AVX-512) [AVX512BW]
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureAVX512(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!pAddress || !unSize || !szSignature) {
 				return nullptr;
 			}
@@ -1822,53 +2008,57 @@ namespace Detours {
 			unsigned char const* const pData = static_cast<unsigned char const* const>(pAddress);
 			unsigned char const* const pSignature = reinterpret_cast<unsigned char const* const>(szSignature);
 
-			const size_t unDataBytesCycles = unSize / 64;
+			const size_t unLastStart = unSize - unSignatureLength;
+			if (unLastStart < 63) {
+				return FindSignatureAVX2(pData, unSize, szSignature, unIgnoredByte, unOffset);
+			}
+
+			const size_t unEnd = unLastStart - 63;
+			const size_t unEndAligned = (unEnd & ~static_cast<size_t>(63));
+			const size_t unDataBytesCycles = (unEndAligned / 64) + 1;
+
 			for (size_t unCycle = 0; unCycle < unDataBytesCycles; ++unCycle) {
 				const size_t unCycleOffset = unCycle * 64;
 
-				if ((unCycle != 0) && ((unCycle + 1) <= unDataBytesCycles)) {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset + 64), _MM_HINT_T0);
-				} else {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset), _MM_HINT_T0);
+				const size_t unPrefetch = unCycleOffset + 128;
+				if (unPrefetch < unSize) {
+					_mm_prefetch(reinterpret_cast<char const* const>(pData + unPrefetch), _MM_HINT_T0);
 				}
 
-				unsigned __int64 unFound = 0xFFFFFFFFFFFFFFFFui64;
+				unsigned __int64 unFound = 0xFFFFFFFFFFFFFFFF;
+
 				for (size_t unSignatureIndex = 0; (unSignatureIndex < unSignatureLength) && (unFound != 0); ++unSignatureIndex) {
 					const unsigned char unSignatureByte = pSignature[unSignatureIndex];
 					if (unSignatureByte == unIgnoredByte) {
 						continue;
 					}
 
-					const __m512i zmm0 = _mm512_loadu_si512(reinterpret_cast<const __m256i*>(pData + unCycleOffset + unSignatureIndex));
+					const __m512i zmm0 = _mm512_loadu_si512(reinterpret_cast<const void*>(pData + unCycleOffset + unSignatureIndex));
 					const __m512i zmm1 = _mm512_set1_epi8(static_cast<char>(unSignatureByte));
 
-					unFound &= _mm512_cmpeq_epi8_mask(zmm0, zmm1);
+					unFound &= static_cast<unsigned __int64>(_mm512_cmpeq_epi8_mask(zmm0, zmm1));
 				}
 
 				if (unFound != 0) {
-					unsigned char const* const pFoundAddress = pData + unCycleOffset + __bit_scan_forward(unFound);
+					const size_t unBitIndex = static_cast<size_t>(__bit_scan_forward(unFound));
+					const size_t unStartIndex = unCycleOffset + unBitIndex;
 
-					if (unHash && !CheckSignatureHash(pFoundAddress, unHash)) {
-						return nullptr;
-					}
-
+					unsigned char const* const pFoundAddress = pData + unStartIndex;
 					return pFoundAddress + unOffset;
 				}
 			}
 
-			const size_t unDataBytesLeft = unSize & 0x3F;
-			if (unDataBytesLeft) {
-				if (unDataBytesLeft < unSignatureLength) {
-					return FindSignatureAVX2(pData + unSize - unDataBytesLeft - unSignatureLength, unDataBytesLeft + unSignatureLength, szSignature, unIgnoredByte, unOffset, unHash);
-				}
-
-				return FindSignatureAVX2(pData + unSize - unDataBytesLeft, unDataBytesLeft, szSignature, unIgnoredByte, unOffset, unHash);
+			const size_t unCoveredEnd = unEndAligned + 63;
+			if (unCoveredEnd < unLastStart) {
+				unsigned char const* const pTail = pData + (unCoveredEnd + 1);
+				const size_t unTailSize = unSize - (unCoveredEnd + 1);
+				return FindSignatureAVX2(pTail, unTailSize, szSignature, unIgnoredByte, unOffset);
 			}
 
 			return nullptr;
 		}
 
-		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1877,10 +2067,10 @@ namespace Detours {
 			const auto& pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(hModule) + pDH->e_lfanew);
 			const auto& pOH = &(pNTHs->OptionalHeader);
 
-			return FindSignatureAVX512(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -1891,10 +2081,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1905,10 +2095,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1918,10 +2108,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1931,10 +2121,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1944,10 +2134,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1957,10 +2147,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -1970,10 +2160,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -1983,32 +2173,32 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignatureAVX512(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignatureAVX512(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
 #ifdef _UNICODE
-		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX512W(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX512W(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX512W(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX512(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX512W(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX512W(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX512W(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #else
-		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX512A(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX512A(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX512A(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX512(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX512A(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureAVX512A(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureAVX512A(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #endif
 
@@ -2021,7 +2211,7 @@ namespace Detours {
 		static bool bFeatureAVX2 = false;
 		static bool bFeatureAVX512BW = false;
 
-		void const* FindSignature(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignature(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 
 			if (!bOnceInitialization) {
 				bOnceInitialization = true;
@@ -2040,17 +2230,17 @@ namespace Detours {
 			}
 
 			if (bFeatureAVX512BW) {
-				return FindSignatureAVX512(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+				return FindSignatureAVX512(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 			} else if (bFeatureAVX2) {
-				return FindSignatureAVX2(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+				return FindSignatureAVX2(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 			} else if (bFeatureSSE2) {
-				return FindSignatureSSE2(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+				return FindSignatureSSE2(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 			} else {
-				return FindSignatureNative(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+				return FindSignatureNative(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 			}
 		}
 
-		void const* FindSignature(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignature(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -2059,10 +2249,10 @@ namespace Detours {
 			const auto& pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(hModule) + pDH->e_lfanew);
 			const auto& pOH = &(pNTHs->OptionalHeader);
 
-			return FindSignature(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignature(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignature(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSignature) {
 				return nullptr;
 			}
@@ -2073,10 +2263,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignature(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignature(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!hModule || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -2087,10 +2277,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(pAddress, unSize, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(pAddress, unSize, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -2100,10 +2290,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -2113,10 +2303,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -2126,10 +2316,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -2139,10 +2329,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(hModule, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(hModule, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSignature) {
 				return nullptr;
 			}
@@ -2152,10 +2342,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(hModule, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(hModule, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
+		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
 			if (!szModuleName || !szSectionName || !szSignature) {
 				return nullptr;
 			}
@@ -2165,32 +2355,32 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindSignature(hModule, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+			return FindSignature(hModule, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
 #ifdef _UNICODE
-		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureW(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureW(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignature(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureW(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignature(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureW(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureW(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureW(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #else
-		void const* FindSignature(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureA(szModuleName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignature(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureA(szModuleName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignature(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureA(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignature(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureA(szModuleName, SectionName, szSignature, unIgnoredByte, unOffset);
 		}
 
-		void const* FindSignature(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset, const unsigned int unHash) noexcept {
-			return FindSignatureA(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset, unHash);
+		void const* FindSignature(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte, const size_t unOffset) noexcept {
+			return FindSignatureA(szModuleName, szSectionName, szSignature, unIgnoredByte, unOffset);
 		}
 #endif
 
@@ -2199,27 +2389,38 @@ namespace Detours {
 		// ----------------------------------------------------------------
 
 		void const* FindDataNative(void const* const pAddress, const size_t unSize, unsigned char const* const pData, const size_t unDataSize) noexcept {
-			if (!pAddress || !unSize || !pData || !unDataSize || (unSize < unDataSize)) {
+			if (!pAddress || !pData || !unDataSize || (unSize < unDataSize)) {
 				return nullptr;
 			}
 
-			unsigned char const* const pSourceData = reinterpret_cast<unsigned char const* const>(pAddress);
+			unsigned char const* const pSourceData = static_cast<unsigned char const*>(pAddress);
 
-			for (size_t unIndex = 0; unIndex < unSize - unDataSize; ++unIndex) {
-				//if (memcmp(pSourceData + unIndex, pData, unDataSize) == 0) {
-				//	return pSourceData + unIndex;
-				//}
+			if (unDataSize == 1) {
+				return memchr(pSourceData, pData[0], unSize);
+			}
 
-				size_t unDataIndex = 0;
-				for (; unDataIndex < unDataSize; ++unDataIndex) {
-					if (pSourceData[unIndex + unDataIndex] != pData[unDataIndex]) {
-						break;
+			const unsigned char unFirst = pData[0];
+			const unsigned char unAnchorValue = pData[unDataSize - 1];
+
+			unsigned char const* pScanBegin = pSourceData + (unDataSize - 1);
+			size_t unScanCount = unSize - (unDataSize - 1);
+			while (unScanCount) {
+				unsigned char const* const pAnchor = static_cast<unsigned char const*>(memchr(pScanBegin, unAnchorValue, unScanCount));
+				if (!pAnchor) {
+					break;
+				}
+
+				const size_t unBase = static_cast<size_t>(pAnchor - pSourceData) + 1 - unDataSize;
+
+				if (pSourceData[unBase] == unFirst) {
+					if ((unDataSize == 2) || (memcmp(pSourceData + unBase + 1, pData + 1, unDataSize - 2) == 0)) {
+						return pSourceData + unBase;
 					}
 				}
 
-				if (unDataIndex == unDataSize) {
-					return pSourceData + unIndex;
-				}
+				const size_t unAdvance = static_cast<size_t>((pAnchor + 1) - pScanBegin);
+				pScanBegin += unAdvance;
+				unScanCount -= unAdvance;
 			}
 
 			return nullptr;
@@ -2290,7 +2491,7 @@ namespace Detours {
 
 			return FindDataNative(hModule, SectionName, pData, unDataSize);
 		}
-		
+
 		void const* FindDataNativeA(char const* const szModuleName, char const* const szSectionName, unsigned char const* const pData, const size_t unDataSize) noexcept {
 			if (!szModuleName || !szSectionName || !pData || !unDataSize) {
 				return nullptr;
@@ -2380,38 +2581,47 @@ namespace Detours {
 
 			unsigned char const* const pSourceData = reinterpret_cast<unsigned char const* const>(pAddress);
 
-			const size_t unDataBytesCycles = unSize / 16;
+			const size_t unLastStart = unSize - unDataSize;
+			if (unLastStart < 15) {
+				return FindDataNative(pSourceData, unSize, pData, unDataSize);
+			}
+
+			const size_t unEnd = unLastStart - 15;
+			const size_t unEndAligned = (unEnd & ~static_cast<size_t>(15));
+			const size_t unDataBytesCycles = (unEndAligned / 16) + 1;
+
 			for (size_t unCycle = 0; unCycle < unDataBytesCycles; ++unCycle) {
 				const size_t unCycleOffset = unCycle * 16;
 
-				if ((unCycle != 0) && ((unCycle + 1) <= unDataBytesCycles)) {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset + 16), _MM_HINT_T0);
-				} else {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset), _MM_HINT_T0);
+				const size_t unPrefetch = unCycleOffset + 64;
+				if (unPrefetch < unSize) {
+					_mm_prefetch(reinterpret_cast<char const* const>(pSourceData + unPrefetch), _MM_HINT_T0);
 				}
 
-				unsigned __int16 unFound = 0xFFFFui16;
+				unsigned __int16 unFound = 0xFFFF;
+
 				for (size_t unDataIndex = 0; (unDataIndex < unDataSize) && (unFound != 0); ++unDataIndex) {
 					const __m128i xmm1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pSourceData + unCycleOffset + unDataIndex));
 					const __m128i xmm2 = _mm_set1_epi8(static_cast<char>(pData[unDataIndex]));
-
 					const __m128i xmm3 = _mm_cmpeq_epi8(xmm1, xmm2);
 
-					unFound &= _mm_movemask_epi8(xmm3);
+					unFound &= static_cast<unsigned __int16>(_mm_movemask_epi8(xmm3));
 				}
 
 				if (unFound != 0) {
-					return pSourceData + unCycleOffset + __bit_scan_forward(unFound);
+					const size_t unBitIndex = static_cast<size_t>(__bit_scan_forward(unFound));
+					const size_t unStartIndex = unCycleOffset + unBitIndex;
+
+					unsigned char const* const pFoundAddress = pSourceData + unStartIndex;
+					return pFoundAddress;
 				}
 			}
 
-			const size_t unDataBytesLeft = unSize & 0xF;
-			if (unDataBytesLeft) {
-				if (unDataBytesLeft < unDataSize) {
-					return FindDataNative(pSourceData + unSize - unDataBytesLeft - unDataSize, unDataBytesLeft + unDataSize, pData, unDataSize);
-				}
-
-				return FindDataNative(pSourceData + unSize - unDataBytesLeft, unDataBytesLeft, pData, unDataSize);
+			const size_t unCoveredEnd = unEndAligned + 15;
+			if (unCoveredEnd < unLastStart) {
+				unsigned char const* const pTail = pSourceData + (unCoveredEnd + 1);
+				const size_t unTailSize = unSize - (unCoveredEnd + 1);
+				return FindDataNative(pTail, unTailSize, pData, unDataSize);
 			}
 
 			return nullptr;
@@ -2572,38 +2782,47 @@ namespace Detours {
 
 			unsigned char const* const pSourceData = reinterpret_cast<unsigned char const* const>(pAddress);
 
-			const size_t unDataBytesCycles = unSize / 32;
+			const size_t unLastStart = unSize - unDataSize;
+			if (unLastStart < 31) {
+				return FindDataSSE2(pSourceData, unSize, pData, unDataSize);
+			}
+
+			const size_t unEnd = unLastStart - 31;
+			const size_t unEndAligned = (unEnd & ~static_cast<size_t>(31));
+			const size_t unDataBytesCycles = (unEndAligned / 32) + 1;
+
 			for (size_t unCycle = 0; unCycle < unDataBytesCycles; ++unCycle) {
 				const size_t unCycleOffset = unCycle * 32;
 
-				if ((unCycle != 0) && ((unCycle + 1) <= unDataBytesCycles)) {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset + 32), _MM_HINT_T0);
-				} else {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset), _MM_HINT_T0);
+				const size_t unPrefetch = unCycleOffset + 64;
+				if (unPrefetch < unSize) {
+					_mm_prefetch(reinterpret_cast<char const* const>(pSourceData + unPrefetch), _MM_HINT_T0);
 				}
 
-				unsigned __int32 unFound = 0xFFFFFFFFui32;
+				unsigned __int32 unFound = 0xFFFFFFFF;
+
 				for (size_t unDataIndex = 0; (unDataIndex < unDataSize) && (unFound != 0); ++unDataIndex) {
 					const __m256i ymm0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pSourceData + unCycleOffset + unDataIndex));
 					const __m256i ymm1 = _mm256_set1_epi8(static_cast<char>(pData[unDataIndex]));
-
 					const __m256i ymm3 = _mm256_cmpeq_epi8(ymm0, ymm1);
 
-					unFound &= _mm256_movemask_epi8(ymm3);
+					unFound &= static_cast<unsigned __int32>(_mm256_movemask_epi8(ymm3));
 				}
 
 				if (unFound != 0) {
-					return pSourceData + unCycleOffset + __bit_scan_forward(unFound);
+					const size_t unBitIndex = static_cast<size_t>(__bit_scan_forward(unFound));
+					const size_t unStartIndex = unCycleOffset + unBitIndex;
+
+					unsigned char const* const pFoundAddress = pSourceData + unStartIndex;
+					return pFoundAddress;
 				}
 			}
 
-			const size_t unDataBytesLeft = unSize & 0x1F;
-			if (unDataBytesLeft) {
-				if (unDataBytesLeft < unDataSize) {
-					return FindDataSSE2(pSourceData + unSize - unDataBytesLeft - unDataSize, unDataBytesLeft + unDataSize, pData, unDataSize);
-				}
-
-				return FindDataSSE2(pSourceData + unSize - unDataBytesLeft, unDataBytesLeft, pData, unDataSize);
+			const size_t unCoveredEnd = unEndAligned + 31;
+			if (unCoveredEnd < unLastStart) {
+				unsigned char const* const pTail = pSourceData + (unCoveredEnd + 1);
+				const size_t unTailSize = unSize - (unCoveredEnd + 1);
+				return FindDataSSE2(pTail, unTailSize, pData, unDataSize);
 			}
 
 			return nullptr;
@@ -2764,36 +2983,47 @@ namespace Detours {
 
 			unsigned char const* const pSourceData = reinterpret_cast<unsigned char const* const>(pAddress);
 
-			const size_t unDataBytesCycles = unSize / 64;
+			const size_t unLastStart = unSize - unDataSize;
+			if (unLastStart < 63) {
+				return FindDataAVX2(pSourceData, unSize, pData, unDataSize);
+			}
+
+			const size_t unEnd = unLastStart - 63;
+			const size_t unEndAligned = (unEnd & ~static_cast<size_t>(63));
+			const size_t unDataBytesCycles = (unEndAligned / 64) + 1;
+
 			for (size_t unCycle = 0; unCycle < unDataBytesCycles; ++unCycle) {
 				const size_t unCycleOffset = unCycle * 64;
 
-				if ((unCycle != 0) && ((unCycle + 1) <= unDataBytesCycles)) {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset + 64), _MM_HINT_T0);
-				} else {
-					_mm_prefetch(reinterpret_cast<char const* const>(pData + unCycleOffset), _MM_HINT_T0);
+				const size_t unPrefetch = unCycleOffset + 128;
+				if (unPrefetch < unSize) {
+					_mm_prefetch(reinterpret_cast<char const* const>(pSourceData + unPrefetch), _MM_HINT_T0);
 				}
 
-				unsigned __int64 unFound = 0xFFFFFFFFFFFFFFFFui64;
+				unsigned __int64 unFound = 0xFFFFFFFFFFFFFFFF;
+
 				for (size_t unDataIndex = 0; (unDataIndex < unDataSize) && (unFound != 0); ++unDataIndex) {
-					const __m512i zmm0 = _mm512_loadu_si512(reinterpret_cast<const __m256i*>(pSourceData + unCycleOffset + unDataIndex));
+					const __m512i zmm0 = _mm512_loadu_si512(reinterpret_cast<const void*>(pSourceData + unCycleOffset + unDataIndex));
 					const __m512i zmm1 = _mm512_set1_epi8(static_cast<char>(pData[unDataIndex]));
 
-					unFound &= _mm512_cmpeq_epi8_mask(zmm0, zmm1);
+					const __mmask64 k = _mm512_cmpeq_epi8_mask(zmm0, zmm1);
+					unFound &= static_cast<unsigned __int64>(k);
 				}
 
 				if (unFound != 0) {
-					return pSourceData + unCycleOffset + __bit_scan_forward(unFound);
+					const size_t unBitIndex = static_cast<size_t>(__bit_scan_forward(unFound));
+					const size_t unStartIndex = unCycleOffset + unBitIndex;
+
+					unsigned char const* const pFoundAddress = pSourceData + unStartIndex;
+					return pFoundAddress;
 				}
 			}
 
-			const size_t unDataBytesLeft = unSize & 0x3F;
-			if (unDataBytesLeft) {
-				if (unDataBytesLeft < unDataSize) {
-					return FindDataAVX2(pSourceData + unSize - unDataBytesLeft - unDataSize, unDataBytesLeft + unDataSize, pData, unDataSize);
-				}
-
-				return FindDataAVX2(pSourceData + unSize - unDataBytesLeft, unDataBytesLeft, pData, unDataSize);
+			const size_t unCoveredEnd = unEndAligned + 63;
+			if (unCoveredEnd < unLastStart) {
+				unsigned char const* const pTail = pSourceData + (unCoveredEnd + 1);
+				const size_t unTailSize = unSize - (unCoveredEnd + 1);
+				return FindDataAVX2(pTail, unTailSize, pData, unDataSize);
 			}
 
 			return nullptr;
@@ -3128,112 +3358,413 @@ namespace Detours {
 	namespace RTTI {
 
 		// ----------------------------------------------------------------
-		// Definitions
+		// IsValidCompleteObjectLocator
+		// ----------------------------------------------------------------
+
+		static inline bool IsValidCompleteObjectLocator(PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator) {
+			if (!pCompleteObjectLocator) {
+				return false;
+			}
+
+			__try {
+				const unsigned int unSignature = pCompleteObjectLocator->m_unSignature;
+				if ((unSignature != COL_SIG_REV0) && (unSignature != COL_SIG_REV1)) {
+					return false;
+				}
+
+				void* pModuleBase = nullptr;
+				if (!RtlPcToFileHeader(reinterpret_cast<PVOID>(pCompleteObjectLocator), &pModuleBase) || !pModuleBase) {
+					return false;
+				}
+
+				const PIMAGE_DOS_HEADER pDH = reinterpret_cast<PIMAGE_DOS_HEADER>(pModuleBase);
+				if (!pDH || (pDH->e_magic != IMAGE_DOS_SIGNATURE)) {
+					return false;
+				}
+
+				const PIMAGE_NT_HEADERS pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(pModuleBase) + pDH->e_lfanew);
+				if (!pNTHs || (pNTHs->Signature != IMAGE_NT_SIGNATURE)) {
+					return false;
+				}
+
+				const uintptr_t unImageBaseRtl = reinterpret_cast<uintptr_t>(pModuleBase);
+				const uintptr_t unImageEndRtl = unImageBaseRtl + pNTHs->OptionalHeader.SizeOfImage;
+
+#ifdef _M_X64
+				uintptr_t unImageBase = unImageBaseRtl;
+				if (unSignature == COL_SIG_REV1) {
+					if (pCompleteObjectLocator->m_unSelf == 0) {
+						return false;
+					}
+
+					unImageBase = reinterpret_cast<uintptr_t>(pCompleteObjectLocator) - static_cast<uintptr_t>(pCompleteObjectLocator->m_unSelf);
+					if (unImageBase != unImageBaseRtl) {
+						return false;
+					}
+				}
+
+				const PRTTI_TYPE_DESCRIPTOR pTypeDescriptor = reinterpret_cast<PRTTI_TYPE_DESCRIPTOR>(unImageBase + pCompleteObjectLocator->m_unTypeDescriptor);
+				const PRTTI_CLASS_HIERARCHY_DESCRIPTOR pClassHierarchyDescriptor = reinterpret_cast<PRTTI_CLASS_HIERARCHY_DESCRIPTOR>(unImageBase + pCompleteObjectLocator->m_unClassHierarchyDescriptor);
+#elif _M_IX86
+				const PRTTI_TYPE_DESCRIPTOR pTypeDescriptor = pCompleteObjectLocator->m_pTypeDescriptor;
+				if (!pTypeDescriptor) {
+					return false;
+				}
+
+				const PRTTI_CLASS_HIERARCHY_DESCRIPTOR pClassHierarchyDescriptor = pCompleteObjectLocator->m_pClassHierarchyDescriptor;
+				if (!pClassHierarchyDescriptor) {
+					return false;
+				}
+#endif
+
+				{
+					const uintptr_t unTypeDescriptor = reinterpret_cast<uintptr_t>(pTypeDescriptor);
+					if ((unTypeDescriptor < unImageBaseRtl) || (unTypeDescriptor >= unImageEndRtl)) {
+						return false;
+					}
+
+					const uintptr_t unClassHierarchyDescriptor = reinterpret_cast<uintptr_t>(pClassHierarchyDescriptor);
+					if ((unClassHierarchyDescriptor < unImageBaseRtl) || (unClassHierarchyDescriptor >= unImageEndRtl)) {
+						return false;
+					}
+				}
+
+				if ((pClassHierarchyDescriptor->m_unSignature != COL_SIG_REV0) && (pClassHierarchyDescriptor->m_unSignature != COL_SIG_REV1)) {
+					return false;
+				}
+
+				const unsigned int unNumberOfBaseClasses = pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
+				if (!unNumberOfBaseClasses || (unNumberOfBaseClasses > 0x1000)) {
+					return false;
+				}
+
+#ifdef _M_X64
+				const PRTTI_BASE_CLASS_ARRAY pBaseClassArray = reinterpret_cast<PRTTI_BASE_CLASS_ARRAY>(unImageBase + pClassHierarchyDescriptor->m_unBaseClassArray);
+#elif _M_IX86
+				const PRTTI_BASE_CLASS_ARRAY pBaseClassArray = pClassHierarchyDescriptor->m_pBaseClassArray;
+				if (!pBaseClassArray) {
+					return false;
+				}
+#endif
+
+				{
+					const uintptr_t unBaseClassArray = reinterpret_cast<uintptr_t>(pBaseClassArray);
+					if ((unBaseClassArray < unImageBaseRtl) || (unBaseClassArray >= unImageEndRtl)) {
+						return false;
+					}
+				}
+
+				if (unNumberOfBaseClasses > 0) {
+#ifdef _M_X64
+					const PRTTI_BASE_CLASS_DESCRIPTOR pFirstBCD = reinterpret_cast<PRTTI_BASE_CLASS_DESCRIPTOR>(unImageBase + pBaseClassArray->m_unBaseClassDescriptors[0]);
+#elif _M_IX86
+					const PRTTI_BASE_CLASS_DESCRIPTOR pFirstBCD = pBaseClassArray->m_pBaseClassDescriptors[0];
+					if (!pFirstBCD) {
+						return false;
+					}
+#endif
+
+					{
+						const uintptr_t unFirstBCD = reinterpret_cast<uintptr_t>(pFirstBCD);
+						if ((unFirstBCD < unImageBaseRtl) || (unFirstBCD >= unImageEndRtl)) {
+							return false;
+						}
+					}
+
+#ifdef _M_X64
+					const PRTTI_TYPE_DESCRIPTOR pFirstTD = reinterpret_cast<PRTTI_TYPE_DESCRIPTOR>(unImageBase + pFirstBCD->m_unTypeDescriptor);
+#elif _M_IX86
+					const PRTTI_TYPE_DESCRIPTOR pFirstTD = pFirstBCD->m_pTypeDescriptor;
+					if (!pFirstTD) {
+						return false;
+					}
+#endif
+
+					{
+						const uintptr_t unFirstTD = reinterpret_cast<uintptr_t>(pFirstTD);
+						if ((unFirstTD < unImageBaseRtl) || (unFirstTD >= unImageEndRtl)) {
+							return false;
+						}
+					}
+
+					if (pFirstTD != pTypeDescriptor) {
+						return false;
+					}
+				}
+
+				return true;
+			} __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+				return false;
+			}
+		}
+
+		// ----------------------------------------------------------------
+		// GetCompleteObjectLocatorFromObjectAt
+		// ----------------------------------------------------------------
+
+		static inline const PRTTI_COMPLETE_OBJECT_LOCATOR GetCompleteObjectLocatorFromObjectAt(void* const pThisWithVfAt0) {
+			if (!pThisWithVfAt0) {
+				return nullptr;
+			}
+
+			return reinterpret_cast<PRTTI_COMPLETE_OBJECT_LOCATOR>((reinterpret_cast<void***>(pThisWithVfAt0)[0])[-1]);
+		}
+
+		// ----------------------------------------------------------------
+		// GetCompleteObjectLocatorFromObject
+		// ----------------------------------------------------------------
+
+		static inline const PRTTI_COMPLETE_OBJECT_LOCATOR GetCompleteObjectLocatorFromObject(void* const pAddress, const LONG nVfDelta) {
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			return GetCompleteObjectLocatorFromObjectAt(reinterpret_cast<char*>(pAddress) + nVfDelta);
+		}
+
+		// ----------------------------------------------------------------
+		// FindCompleteObject
+		// ----------------------------------------------------------------
+
+		static inline void* const FindCompleteObject(void* const pAddress, const LONG nVfDelta) {
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			char* const pThisWithVfAt0 = reinterpret_cast<char*>(pAddress) + nVfDelta;
+			const auto& pCompleteObjectLocator = GetCompleteObjectLocatorFromObjectAt(pThisWithVfAt0);
+
+			char* pCompleteObject = pThisWithVfAt0 - pCompleteObjectLocator->m_unOffset;
+
+			if (pCompleteObjectLocator->m_unConstructorOffset) {
+				pCompleteObject -= *reinterpret_cast<int*>(pThisWithVfAt0 - pCompleteObjectLocator->m_unConstructorOffset);
+			}
+
+			return pCompleteObject;
+		}
+
+		// ----------------------------------------------------------------
+		// GuessVfDelta
+		// ----------------------------------------------------------------
+
+		static LONG GuessVfDelta(void* const pAddress) {
+			if (!pAddress) {
+				return 0;
+			}
+
+			for (LONG nDelta = 0; nDelta <= 0x80; nDelta += static_cast<LONG>(sizeof(void*))) {
+				__try {
+					void** pVptr = *reinterpret_cast<void***>(reinterpret_cast<char*>(pAddress) + nDelta);
+					if (!pVptr) {
+						continue;
+					}
+
+					const auto& pLocator = reinterpret_cast<PRTTI_COMPLETE_OBJECT_LOCATOR>(pVptr[-1]);
+					if (IsValidCompleteObjectLocator(pLocator)) {
+						return nDelta;
+					}
+				} __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+				}
+			}
+
+			return 0;
+		}
+
+		// ----------------------------------------------------------------
+		// __GetBaseClassDescriptor
 		// ----------------------------------------------------------------
 
 #ifdef _M_X64
 		static inline const PRTTI_BASE_CLASS_DESCRIPTOR __GetBaseClassDescriptor(void const* const pBaseAddress, const PRTTI_BASE_CLASS_ARRAY pBaseClassArray, const size_t unIndex) {
+#elif _M_IX86
+		static inline const PRTTI_BASE_CLASS_DESCRIPTOR __GetBaseClassDescriptor(const PRTTI_BASE_CLASS_ARRAY pBaseClassArray, const size_t unIndex) {
+#endif
+
+#ifdef _M_X64
+			if (!pBaseAddress || !pBaseClassArray) {
+				return nullptr;
+			}
+#elif _M_IX86
+			if (!pBaseClassArray) {
+				return nullptr;
+			}
+#endif
+
+#ifdef _M_X64
 			return reinterpret_cast<const PRTTI_BASE_CLASS_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pBaseClassArray->m_unBaseClassDescriptors[unIndex]);
+#elif _M_IX86
+			return pBaseClassArray->m_pBaseClassDescriptors[unIndex];
+#endif
 		}
 
+		// ----------------------------------------------------------------
+		// __GetBaseClassArray
+		// ----------------------------------------------------------------
+
+#ifdef _M_X64
 		static inline const PRTTI_BASE_CLASS_ARRAY __GetBaseClassArray(void const* const pBaseAddress, const PRTTI_CLASS_HIERARCHY_DESCRIPTOR pClassHierarchyDescriptor) {
+#elif _M_IX86
+		static inline const PRTTI_BASE_CLASS_ARRAY __GetBaseClassArray(const PRTTI_CLASS_HIERARCHY_DESCRIPTOR pClassHierarchyDescriptor) {
+#endif
+
+#ifdef _M_X64
+			if (!pBaseAddress || !pClassHierarchyDescriptor) {
+				return nullptr;
+			}
+#elif _M_IX86
+			if (!pClassHierarchyDescriptor) {
+				return nullptr;
+			}
+#endif
+
+#ifdef _M_X64
 			return reinterpret_cast<const PRTTI_BASE_CLASS_ARRAY>(reinterpret_cast<size_t>(pBaseAddress) + pClassHierarchyDescriptor->m_unBaseClassArray);
+#elif _M_IX86
+			return pClassHierarchyDescriptor->m_pBaseClassArray;
+#endif
 		}
 
+		// ----------------------------------------------------------------
+		// __GetTypeDescriptor
+		// ----------------------------------------------------------------
+
+#ifdef _M_X64
 		static inline const PRTTI_TYPE_DESCRIPTOR __GetTypeDescriptor(void const* const pBaseAddress, const PRTTI_BASE_CLASS_DESCRIPTOR pBaseClassDescriptor) {
+#elif _M_IX86
+		static inline const PRTTI_TYPE_DESCRIPTOR __GetTypeDescriptor(const PRTTI_BASE_CLASS_DESCRIPTOR pBaseClassDescriptor) {
+#endif
+
+#ifdef _M_X64
+			if (!pBaseAddress || !pBaseClassDescriptor) {
+				return nullptr;
+			}
+#elif _M_IX86
+			if (!pBaseClassDescriptor) {
+				return nullptr;
+			}
+#endif
+
+#ifdef _M_X64
 			return reinterpret_cast<const PRTTI_TYPE_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pBaseClassDescriptor->m_unTypeDescriptor);
+#elif _M_IX86
+			return pBaseClassDescriptor->m_pTypeDescriptor;
+#endif
 		}
 
+#ifdef _M_X64
 		static inline const PRTTI_TYPE_DESCRIPTOR __GetTypeDescriptor(void const* const pBaseAddress, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator) {
+#elif _M_IX86
+		static inline const PRTTI_TYPE_DESCRIPTOR __GetTypeDescriptor(const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator) {
+#endif
+
+#ifdef _M_X64
+			if (!pBaseAddress || !pCompleteObjectLocator) {
+				return nullptr;
+			}
+#elif _M_IX86
+			if (!pCompleteObjectLocator) {
+				return nullptr;
+			}
+#endif
+
+#ifdef _M_X64
 			return reinterpret_cast<const PRTTI_TYPE_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pCompleteObjectLocator->m_unTypeDescriptor);
+#elif _M_IX86
+			return pCompleteObjectLocator->m_pTypeDescriptor;
+#endif
 		}
 
+		// ----------------------------------------------------------------
+		// __GetClassHierarchyDescriptor
+		// ----------------------------------------------------------------
+
+#ifdef _M_X64
 		static inline const PRTTI_CLASS_HIERARCHY_DESCRIPTOR __GetClassHierarchyDescriptor(void const* const pBaseAddress, const PRTTI_BASE_CLASS_DESCRIPTOR pBaseClassDescriptor) {
+#elif _M_IX86
+		static inline const PRTTI_CLASS_HIERARCHY_DESCRIPTOR __GetClassHierarchyDescriptor(const PRTTI_BASE_CLASS_DESCRIPTOR pBaseClassDescriptor) {
+#endif
+
+#ifdef _M_X64
+			if (!pBaseAddress || !pBaseClassDescriptor) {
+				return nullptr;
+			}
+#elif _M_IX86
+			if (!pBaseClassDescriptor) {
+				return nullptr;
+			}
+#endif
+
+#ifdef _M_X64
 			return reinterpret_cast<const PRTTI_CLASS_HIERARCHY_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pBaseClassDescriptor->m_unClassHierarchyDescriptor);
+#elif _M_IX86
+			return pBaseClassDescriptor->m_pClassHierarchyDescriptor;
+#endif
 		}
 
-		static inline const PRTTI_CLASS_HIERARCHY_DESCRIPTOR __GetClassHierarchyDescriptor(void const* const pBaseAddress, PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator) {
+#ifdef _M_X64
+		static inline const PRTTI_CLASS_HIERARCHY_DESCRIPTOR __GetClassHierarchyDescriptor(void const* const pBaseAddress, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator) {
+#elif _M_IX86
+		static inline const PRTTI_CLASS_HIERARCHY_DESCRIPTOR __GetClassHierarchyDescriptor(const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator) {
+#endif
+
+#ifdef _M_X64
+			if (!pBaseAddress || !pCompleteObjectLocator) {
+				return nullptr;
+			}
+#elif _M_IX86
+			if (!pCompleteObjectLocator) {
+				return nullptr;
+			}
+#endif
+
+#ifdef _M_X64
 			return reinterpret_cast<const PRTTI_CLASS_HIERARCHY_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pCompleteObjectLocator->m_unClassHierarchyDescriptor);
-		}
+#elif _M_IX86
+			return pCompleteObjectLocator->m_pClassHierarchyDescriptor;
 #endif
+		}
 
 		// ----------------------------------------------------------------
-		// Object
+		// IsTypeDescriptorEqual
 		// ----------------------------------------------------------------
 
-		Object::Object(void const* const pBaseAddress, void const* const pAddress, const size_t unSize, const PRTTI_TYPE_DESCRIPTOR pTypeDescriptor, const PRTTI_CLASS_HIERARCHY_DESCRIPTOR pClassHierarchyDescriptor, const PRTTI_BASE_CLASS_ARRAY pBaseClassArray, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObject, void** pVTable) : m_pBaseAddress(pBaseAddress), m_pAddress(pAddress), m_unSize(unSize), m_pTypeDescriptor(pTypeDescriptor), m_pClassHierarchyDescriptor(pClassHierarchyDescriptor), m_pBaseClassArray(pBaseClassArray), m_pCompleteObject(pCompleteObject) {
-			m_pVTable = pVTable;
-			if (pBaseClassArray) {
-				const unsigned int unNumberOfBaseClasses = pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
-				for (unsigned int i = 0; i < unNumberOfBaseClasses; ++i) {
-#ifdef _M_X64
-					const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBaseClassArray, i);
-#elif _M_IX86
-					const auto& pBCD = pBaseClassArray->m_pBaseClassDescriptors[i];
-#endif
-					if (!pBCD) {
-						break;
-					}
-
-#ifdef _M_X64
-					const auto& pCurrentTD = __GetTypeDescriptor(pBaseAddress, pBCD);
-					const auto& pCurrentCHD = __GetClassHierarchyDescriptor(pBaseAddress, pBCD);
-					const auto& pCurrentBCA = __GetBaseClassArray(pBaseAddress, pCurrentCHD);
-#elif _M_IX86
-					const auto& pCurrentTD = pBCD->m_pTypeDescriptor;
-					const auto& pCurrentCHD = pBCD->m_pClassHierarchyDescriptor;
-					const auto& pCurrentBCA = pCurrentCHD->m_pBaseClassArray;
-#endif
-
-					if (pCurrentTD == pTypeDescriptor) {
-						continue;
-					}
-
-					auto pBaseObject = FindObject(pBaseAddress, pAddress, unSize, pCurrentTD->m_szName);
-					if (!pBaseObject) {
-						pBaseObject = FindObject(pBaseAddress, pAddress, unSize, pCurrentTD->m_szName, false);
-						if (!pBaseObject) {
-							m_vecBaseClasses.emplace_back(std::make_unique<Object>(pBaseAddress, pAddress, unSize, pCurrentTD, pCurrentCHD, pCurrentBCA, nullptr, nullptr));
-							continue;
-						}
-					}
-
-					m_vecBaseClasses.emplace_back(std::move(pBaseObject));
-				}
+		static bool IsTypeDescriptorEqual(const PRTTI_TYPE_DESCRIPTOR pLeft, const PRTTI_TYPE_DESCRIPTOR pRight) {
+			if (!pLeft || !pRight) {
+				return false;
 			}
+
+			return (pLeft == pRight) || (strncmp(pLeft->m_szName, pRight->m_szName, 0x1000) == 0);
 		}
 
-		static const PRTTI_COMPLETE_OBJECT_LOCATOR GetCompleteObjectLocatorFromObject(void const* const pAddress) {
-			if (!pAddress) {
-				return nullptr;
+		// ----------------------------------------------------------------
+		// PMDtoOffset
+		// ----------------------------------------------------------------
+
+		static inline ptrdiff_t PMDtoOffset(void* const pCompleteObject, const RTTI_PMD& pmd) {
+			if (!pCompleteObject) {
+				return 0;
 			}
 
-			return static_cast<PRTTI_COMPLETE_OBJECT_LOCATOR const* const*>(pAddress)[0][-1];
+			ptrdiff_t nOffset = 0;
+
+			if (pmd.m_nPDisp >= 0) {
+				nOffset = pmd.m_nPDisp;
+				nOffset += *reinterpret_cast<const int*>(reinterpret_cast<const char*>(*reinterpret_cast<const ptrdiff_t*>(reinterpret_cast<const char*>(pCompleteObject) + nOffset)) + pmd.m_nVDisp);
+			}
+
+			nOffset += pmd.m_nMDisp;
+
+			return nOffset;
 		}
 
-		static void const* const FindCompleteObject(void const* const pAddress) {
-			if (!pAddress) {
-				return nullptr;
-			}
-
-			const auto& pCompleteLocator = GetCompleteObjectLocatorFromObject(pAddress);
-			if (!pCompleteLocator) {
-				return nullptr;
-			}
-
-			const size_t unAddress = reinterpret_cast<size_t>(pAddress);
-			const size_t unCompleteObject = unAddress - pCompleteLocator->m_unOffset;
-
-			const unsigned int unConstructorOffset = pCompleteLocator->m_unConstructorOffset;
-			const int nOffsetValue = !unConstructorOffset ? 0 : *reinterpret_cast<int*>(unAddress - unConstructorOffset);
-
-			return reinterpret_cast<void*>(unCompleteObject - nOffsetValue);
-		}
+		// ----------------------------------------------------------------
+		// FindSITargetTypeInstance
+		// ----------------------------------------------------------------
 
 #ifdef _M_X64
-		static const PRTTI_BASE_CLASS_DESCRIPTOR FindSITargetTypeInstance(void const* const pBaseAddress, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
+		static PRTTI_BASE_CLASS_DESCRIPTOR FindSITargetTypeInstance(void const* const pBaseAddress, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
 #elif _M_IX86
-		static const PRTTI_BASE_CLASS_DESCRIPTOR FindSITargetTypeInstance(const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
+		static PRTTI_BASE_CLASS_DESCRIPTOR FindSITargetTypeInstance(const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
 #endif
 #ifdef _M_X64
 			if (!pBaseAddress || !pCompleteObjectLocator || !pSourceTypeDescriptor || !pTargetTypeDescriptor) {
@@ -3244,133 +3775,79 @@ namespace Detours {
 			}
 
 #ifdef _M_X64
-			const auto& pCHD = __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator);
+			const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator);
 #elif _M_IX86
-			const auto& pCHD = pCompleteObjectLocator->m_pClassHierarchyDescriptor;
+			const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pCompleteObjectLocator);
 #endif
-			if (!pCHD) {
+			if (!pClassHierarchyDescriptor) {
 				return nullptr;
 			}
 
 #ifdef _M_X64
-			const auto& pBCA = __GetBaseClassArray(pBaseAddress, pCHD);
+			const auto& pBaseClassArray = __GetBaseClassArray(pBaseAddress, pClassHierarchyDescriptor);
 #elif _M_IX86
-			const auto& pBCA = pCHD->m_pBaseClassArray;
+			const auto& pBaseClassArray = __GetBaseClassArray(pClassHierarchyDescriptor);
 #endif
-			if (!pBCA) {
+			if (!pBaseClassArray) {
 				return nullptr;
 			}
 
-			const unsigned int unNumberOfBaseClasses = pCHD->m_unNumberOfBaseClasses;
+			const unsigned int unNumberOfBaseClasses = pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
+
+			PRTTI_BASE_CLASS_DESCRIPTOR pSourceBCD = nullptr;
+			PRTTI_BASE_CLASS_DESCRIPTOR pDestinationBCD = nullptr;
+
 			for (unsigned int i = 0; i < unNumberOfBaseClasses; ++i) {
 #ifdef _M_X64
-				const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBCA, i);
+				const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBaseClassArray, i);
 #elif _M_IX86
-				const auto& pBCD = pBCA->m_pBaseClassDescriptors[i];
+				const auto& pBCD = __GetBaseClassDescriptor(pBaseClassArray, i);
 #endif
 				if (!pBCD) {
 					continue;
 				}
 
 #ifdef _M_X64
-				if (__GetTypeDescriptor(pBaseAddress, pBCD) == pTargetTypeDescriptor) {
+				const auto& pTD = __GetTypeDescriptor(pBaseAddress, pBCD);
 #elif _M_IX86
-				if (pBCD->m_pTypeDescriptor == pTargetTypeDescriptor) {
+				const auto& pTD = __GetTypeDescriptor(pBCD);
 #endif
-					for (unsigned int j = i + 1; j < unNumberOfBaseClasses; ++j) {
-#ifdef _M_X64
-						const auto& pSourceBCD = __GetBaseClassDescriptor(pBaseAddress, pBCA, j);
-#elif _M_IX86
-						const auto& pSourceBCD = pBCA->m_pBaseClassDescriptors[j];
-#endif
-						if (!pSourceBCD) {
-							continue;
-						}
-
-						if (pSourceBCD->m_unAttributes & BCD_PRIVORPROTBASE) {
-							return nullptr;
-						}
-
-#ifdef _M_X64
-						if (__GetTypeDescriptor(pBaseAddress, pSourceBCD) == pSourceTypeDescriptor) {
-#elif _M_IX86
-						if (pSourceBCD->m_pTypeDescriptor == pSourceTypeDescriptor) {
-#endif
-							return pBCD;
-						}
-					}
-
-					return nullptr;
-				}
-			}
-
-
-			for (unsigned int i = 0; i < unNumberOfBaseClasses; ++i) {
-#ifdef _M_X64
-				const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBCA, i);
-#elif _M_IX86
-				const auto& pBCD = pBCA->m_pBaseClassDescriptors[i];
-#endif
-				if (!pBCD) {
+				if (!pTD) {
 					continue;
 				}
 
-#ifdef _M_X64
-				if (!strncmp(__GetTypeDescriptor(pBaseAddress, pBCD)->m_szName, pTargetTypeDescriptor->m_szName, 0x1000)) {
-#elif _M_IX86
-				if (!strncmp(pBCD->m_pTypeDescriptor->m_szName, pTargetTypeDescriptor->m_szName, 0x1000)) {
-#endif
-					for (unsigned int j = i + 1; j < unNumberOfBaseClasses; ++j) {
-#ifdef _M_X64
-						const auto& pSourceBCD = __GetBaseClassDescriptor(pBaseAddress, pBCA, j);
-#elif _M_IX86
-						const auto& pSourceBCD = pBCA->m_pBaseClassDescriptors[j];
-#endif
-						if (!pSourceBCD) {
-							continue;
-						}
+				if (!pSourceBCD && IsTypeDescriptorEqual(pTD, pSourceTypeDescriptor)) {
+					pSourceBCD = pBCD;
+				}
 
-						if (pSourceBCD->m_unAttributes & BCD_PRIVORPROTBASE) {
-							return nullptr;
-						}
+				if (!pDestinationBCD && IsTypeDescriptorEqual(pTD, pTargetTypeDescriptor)) {
+					pDestinationBCD = pBCD;
+				}
 
-#ifdef _M_X64
-						if (!strncmp(__GetTypeDescriptor(pBaseAddress, pBCD)->m_szName, pSourceTypeDescriptor->m_szName, 0x1000)) {
-#elif _M_IX86
-						if (!strncmp(pBCD->m_pTypeDescriptor->m_szName, pSourceTypeDescriptor->m_szName, 0x1000)) {
-#endif
-							return pBCD;
-						}
-					}
-
-					return nullptr;
+				if (pSourceBCD && pDestinationBCD) {
+					break;
 				}
 			}
 
-			return nullptr;
-		}
-
-		static bool IsTypeDescriptorEqual(const PRTTI_TYPE_DESCRIPTOR pLeft, const PRTTI_TYPE_DESCRIPTOR pRight) {
-			return (pLeft == pRight) || !strncmp(pLeft->m_szName, pRight->m_szName, 0x1000);
-		}
-
-		static ptrdiff_t PMDtoOffset(void const* const pAddress, const RTTI_PMD pmd) {
-			ptrdiff_t unRetOff = 0;
-
-			if (pmd.m_nPDisp >= 0) {
-				unRetOff = pmd.m_nPDisp;
-				unRetOff += *reinterpret_cast<int*>(reinterpret_cast<char*>(*reinterpret_cast<size_t const* const>(reinterpret_cast<char const* const>(pAddress) + unRetOff)) + pmd.m_nVDisp);
+			if (!pSourceBCD || !pDestinationBCD) {
+				return nullptr;
 			}
 
-			unRetOff += pmd.m_nMDisp;
+			if ((pSourceBCD->m_unAttributes & (BCD_PRIVORPROTBASE | BCD_NOTVISIBLE)) || (pDestinationBCD->m_unAttributes & (BCD_PRIVORPROTBASE | BCD_NOTVISIBLE | BCD_AMBIGUOUS))) {
+				return nullptr;
+			}
 
-			return unRetOff;
+			return pDestinationBCD;
 		}
 
+		// ----------------------------------------------------------------
+		// FindMITargetTypeInstance
+		// ----------------------------------------------------------------
+
 #ifdef _M_X64
-		static const PRTTI_BASE_CLASS_DESCRIPTOR FindMITargetTypeInstance(void const* const pBaseAddress, void const* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
+		static PRTTI_BASE_CLASS_DESCRIPTOR FindMITargetTypeInstance(void const* const pBaseAddress, void* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
 #elif _M_IX86
-		static const PRTTI_BASE_CLASS_DESCRIPTOR FindMITargetTypeInstance(void const* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
+		static PRTTI_BASE_CLASS_DESCRIPTOR FindMITargetTypeInstance(void* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
 #endif
 #ifdef _M_X64
 			if (!pBaseAddress || !pCompleteObject || !pCompleteObjectLocator || !pSourceTypeDescriptor || !pTargetTypeDescriptor) {
@@ -3381,84 +3858,113 @@ namespace Detours {
 			}
 
 #ifdef _M_X64
-			const auto& pBCA = __GetBaseClassArray(pBaseAddress, __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator));
-			const unsigned int unNumberOfBaseClasses = __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator)->m_unNumberOfBaseClasses;
+			const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator);
 #elif _M_IX86
-			const auto& pBCA = pCompleteObjectLocator->m_pClassHierarchyDescriptor->m_pBaseClassArray;
-			const unsigned int unNumberOfBaseClasses = pCompleteObjectLocator->m_pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
+			const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pCompleteObjectLocator);
 #endif
-			if (!pBCA) {
+			if (!pClassHierarchyDescriptor) {
 				return nullptr;
 			}
 
-			unsigned int unTarget = static_cast<unsigned int>(-1);
-			unsigned int nTargetBases = 0;
+#ifdef _M_X64
+			const auto& pBaseClassArray = __GetBaseClassArray(pBaseAddress, pClassHierarchyDescriptor);
+#elif _M_IX86
+			const auto& pBaseClassArray = __GetBaseClassArray(pClassHierarchyDescriptor);
+#endif
+			if (!pBaseClassArray) {
+				return nullptr;
+			}
 
+			const unsigned int unNumberOfBaseClasses = pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
+
+			unsigned int unTargetIndex = static_cast<unsigned int>(-1);
+			unsigned int unTargetBases = 0;
 			PRTTI_BASE_CLASS_DESCRIPTOR pTargetBCD = nullptr;
 			PRTTI_BASE_CLASS_DESCRIPTOR pSourceBCD = nullptr;
 
 			for (unsigned int i = 0; i < unNumberOfBaseClasses; ++i) {
 #ifdef _M_X64
-				const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBCA, i);
+				const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBaseClassArray, i);
 #elif _M_IX86
-				const auto& pBCD = pBCA->m_pBaseClassDescriptors[i];
+				const auto& pBCD = __GetBaseClassDescriptor(pBaseClassArray, i);
 #endif
 				if (!pBCD) {
 					continue;
 				}
 
 #ifdef _M_X64
-				if (((i - unTarget) > nTargetBases) && IsTypeDescriptorEqual(__GetTypeDescriptor(pBaseAddress, pBCD), pTargetTypeDescriptor)) {
+				const auto& pTargetTD = __GetTypeDescriptor(pBaseAddress, pBCD);
 #elif _M_IX86
-				if (((i - unTarget) > nTargetBases) && IsTypeDescriptorEqual(pBCD->m_pTypeDescriptor, pTargetTypeDescriptor)) {
+				const auto& pTargetTD = __GetTypeDescriptor(pBCD);
 #endif
+				if (((i - unTargetIndex) > unTargetBases) && pTargetTD && IsTypeDescriptorEqual(pTargetTD, pTargetTypeDescriptor)) {
 					if (pSourceBCD) {
 						if ((pBCD->m_unAttributes & (BCD_NOTVISIBLE | BCD_AMBIGUOUS)) || (pSourceBCD->m_unAttributes & BCD_NOTVISIBLE)) {
 							return nullptr;
-						} else {
-							return pBCD;
 						}
+
+						return pBCD;
 					}
 
 					pTargetBCD = pBCD;
-					unTarget = i;
-					nTargetBases = pBCD->m_unNumberOfContainedBases;
+					unTargetIndex = i;
+					unTargetBases = pBCD->m_unNumberOfContainedBases;
 				}
 
 #ifdef _M_X64
-				if (IsTypeDescriptorEqual(__GetTypeDescriptor(pBaseAddress, pBCD), pSourceTypeDescriptor) && (PMDtoOffset(pCompleteObject, pBCD->m_Where) == nSourceOffset)) {
+				const auto& pSourceTD = pTargetTD ? pTargetTD : __GetTypeDescriptor(pBaseAddress, pBCD);
 #elif _M_IX86
-				if (IsTypeDescriptorEqual(pBCD->m_pTypeDescriptor, pSourceTypeDescriptor) && (PMDtoOffset(pCompleteObject, pBCD->m_Where) == nSourceOffset)) {
+				const auto& pSourceTD = pTargetTD ? pTargetTD : __GetTypeDescriptor(pBCD);
 #endif
+				if (pSourceTD && IsTypeDescriptorEqual(pSourceTD, pSourceTypeDescriptor) && (PMDtoOffset(pCompleteObject, pBCD->m_Where) == nSourceOffset)) {
 					if (pTargetBCD) {
-						if ((i - unTarget) <= nTargetBases) {
+						if ((i - unTargetIndex) <= unTargetBases) {
 							if (!(pTargetBCD->m_unAttributes & BCD_HASPCHD)) {
-								if (!unTarget && (pBCD->m_unAttributes & BCD_NOTVISIBLE)) {
+								if (!unTargetIndex && (pBCD->m_unAttributes & BCD_NOTVISIBLE)) {
 									return nullptr;
-								} else {
-									return pTargetBCD;
 								}
+
+								return pTargetBCD;
 							}
 
 #ifdef _M_X64
-							const auto& pTargetBCA = __GetBaseClassArray(pBaseAddress, __GetClassHierarchyDescriptor(pBaseAddress, pTargetBCD));
-							const auto& pSourceInTargetBCD = __GetBaseClassDescriptor(pBaseAddress, pTargetBCA, i - unTarget);
-#elif _M_IX86
-							const auto& pTargetBCA = pTargetBCD->m_pClassHierarchyDescriptor->m_pBaseClassArray;
-							const auto& pSourceInTargetBCD = pTargetBCA->m_pBaseClassDescriptors[i - unTarget];
+							const auto& pTargetCHD = __GetClassHierarchyDescriptor(pBaseAddress, pTargetBCD);
+#else
+							const auto& pTargetCHD = __GetClassHierarchyDescriptor(pTargetBCD);
 #endif
+							if (!pTargetCHD) {
+								return nullptr;
+							}
+
+#ifdef _M_X64
+							const auto& pTargetBCA = __GetBaseClassArray(pBaseAddress, pTargetCHD);
+#else
+							const auto& pTargetBCA = __GetBaseClassArray(pTargetCHD);
+#endif
+							if (!pTargetBCA) {
+								return nullptr;
+							}
+
+#ifdef _M_X64
+							const auto& pSourceInTargetBCD = __GetBaseClassDescriptor(pBaseAddress, pTargetBCA, i - unTargetIndex);
+#else
+							const auto& pSourceInTargetBCD = __GetBaseClassDescriptor(pTargetBCA, i - unTargetIndex);
+#endif
+							if (!pSourceInTargetBCD) {
+								return nullptr;
+							}
 
 							if (pSourceInTargetBCD->m_unAttributes & BCD_NOTVISIBLE) {
 								return nullptr;
-							} else {
-								return pTargetBCD;
 							}
+
+							return pTargetBCD;
 						} else {
 							if ((pTargetBCD->m_unAttributes & (BCD_NOTVISIBLE | BCD_AMBIGUOUS)) || (pBCD->m_unAttributes & BCD_NOTVISIBLE)) {
 								return nullptr;
-							} else {
-								return pTargetBCD;
 							}
+
+							return pTargetBCD;
 						}
 					}
 
@@ -3469,10 +3975,14 @@ namespace Detours {
 			return nullptr;
 		}
 
+		// ----------------------------------------------------------------
+		// FindVITargetTypeInstance
+		// ----------------------------------------------------------------
+
 #ifdef _M_X64
-		static const PRTTI_BASE_CLASS_DESCRIPTOR FindVITargetTypeInstance(void const* const pBaseAddress, void const* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
+		static PRTTI_BASE_CLASS_DESCRIPTOR FindVITargetTypeInstance(void const* const pBaseAddress, void* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
 #elif _M_IX86
-		static const PRTTI_BASE_CLASS_DESCRIPTOR FindVITargetTypeInstance(void const* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
+		static PRTTI_BASE_CLASS_DESCRIPTOR FindVITargetTypeInstance(void* const pCompleteObject, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObjectLocator, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const ptrdiff_t nSourceOffset, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor) {
 #endif
 #ifdef _M_X64
 			if (!pBaseAddress || !pCompleteObject || !pCompleteObjectLocator || !pSourceTypeDescriptor || !pTargetTypeDescriptor) {
@@ -3483,77 +3993,103 @@ namespace Detours {
 			}
 
 #ifdef _M_X64
-			auto const& pBCA = __GetBaseClassArray(pBaseAddress, __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator));
-			const unsigned int unNumberOfBaseClasses = __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator)->m_unNumberOfBaseClasses;
+			const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator);
 #elif _M_IX86
-			const auto& pBCA = pCompleteObjectLocator->m_pClassHierarchyDescriptor->m_pBaseClassArray;
-			const unsigned int unNumberOfBaseClasses = pCompleteObjectLocator->m_pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
+			const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pCompleteObjectLocator);
 #endif
+			if (!pClassHierarchyDescriptor) {
+				return nullptr;
+			}
 
-			PRTTI_BASE_CLASS_DESCRIPTOR pCrossCastTargetBCD = nullptr;
+#ifdef _M_X64
+			const auto& pBaseClassArray = __GetBaseClassArray(pBaseAddress, pClassHierarchyDescriptor);
+#elif _M_IX86
+			const auto& pBaseClassArray = __GetBaseClassArray(pClassHierarchyDescriptor);
+#endif
+			if (!pBaseClassArray) {
+				return nullptr;
+			}
+
+			const unsigned int unNumberOfBaseClasses = pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
+
 			PRTTI_BASE_CLASS_DESCRIPTOR pDownCastResultBCD = nullptr;
 			PRTTI_BASE_CLASS_DESCRIPTOR pCrossCastSourceBCD = nullptr;
-
+			PRTTI_BASE_CLASS_DESCRIPTOR pCrossCastTargetBCD = nullptr;
 			PRTTI_BASE_CLASS_DESCRIPTOR pTargetBCD = nullptr;
-			unsigned int unTarget = static_cast<unsigned int>(-1);
+
+			unsigned int unTargetIndex = static_cast<unsigned int>(-1);
 			unsigned int unTargetBases = 0;
 
 			bool bDownCastAllowed = true;
 			bool bDirectlyPublic = false;
 			ptrdiff_t nOffsetDownCastResult = -1;
 
-			PRTTI_BASE_CLASS_ARRAY pTargetBCA = nullptr;
-			PRTTI_BASE_CLASS_DESCRIPTOR pSourceInTargetBCD = nullptr;
-
 			for (unsigned int i = 0; i < unNumberOfBaseClasses; ++i) {
 #ifdef _M_X64
-				const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBCA, i);
+				const auto& pBCD = __GetBaseClassDescriptor(pBaseAddress, pBaseClassArray, i);
 #elif _M_IX86
-				const auto& pBCD = pBCA->m_pBaseClassDescriptors[i];
+				const auto& pBCD = __GetBaseClassDescriptor(pBaseClassArray, i);
 #endif
 				if (!pBCD) {
 					continue;
 				}
 
 #ifdef _M_X64
-				if (((i - unTarget) > unTargetBases) && IsTypeDescriptorEqual(__GetTypeDescriptor(pBaseAddress, pBCD), pTargetTypeDescriptor)) {
+				const auto& pTD = __GetTypeDescriptor(pBaseAddress, pBCD);
 #elif _M_IX86
-				if (((i - unTarget) > unTargetBases) && IsTypeDescriptorEqual(pBCD->m_pTypeDescriptor, pTargetTypeDescriptor)) {
+				const auto& pTD = __GetTypeDescriptor(pBCD);
 #endif
+
+				if (((i - unTargetIndex) > unTargetBases) && pTD && IsTypeDescriptorEqual(pTD, pTargetTypeDescriptor)) {
 					if (!(pBCD->m_unAttributes & (BCD_NOTVISIBLE | BCD_AMBIGUOUS))) {
 						pCrossCastTargetBCD = pBCD;
 					}
 
 					pTargetBCD = pBCD;
-					unTarget = i;
+					unTargetIndex = i;
 					unTargetBases = pBCD->m_unNumberOfContainedBases;
 				}
 
-#ifdef _M_X64
-				if (IsTypeDescriptorEqual(__GetTypeDescriptor(pBaseAddress, pBCD), pSourceTypeDescriptor) && (PMDtoOffset(pCompleteObject, pBCD->m_Where) == nSourceOffset)) {
-#elif _M_IX86
-				if (IsTypeDescriptorEqual(pBCD->m_pTypeDescriptor, pSourceTypeDescriptor) && (PMDtoOffset(pCompleteObject, pBCD->m_Where) == nSourceOffset)) {
-#endif
-					if ((i - unTarget) <= unTargetBases) {
+				if (pTD && IsTypeDescriptorEqual(pTD, pSourceTypeDescriptor) && (PMDtoOffset(pCompleteObject, pBCD->m_Where) == nSourceOffset)) {
+					if ((i - unTargetIndex) <= unTargetBases) {
 						if (bDownCastAllowed) {
 							if (!pTargetBCD) {
 								continue;
 							}
 
 							if (!(pTargetBCD->m_unAttributes & BCD_HASPCHD)) {
-								if (!unTarget && (pTargetBCD->m_unAttributes & BCD_NOTVISIBLE)) {
+								if (!unTargetIndex && (pTargetBCD->m_unAttributes & BCD_NOTVISIBLE)) {
 									bDownCastAllowed = false;
 								}
 
 								bDirectlyPublic = true;
 							} else {
 #ifdef _M_X64
-								pTargetBCA = __GetBaseClassArray(pBaseAddress, __GetClassHierarchyDescriptor(pBaseAddress, pTargetBCD));
-								pSourceInTargetBCD = __GetBaseClassDescriptor(pBaseAddress, pTargetBCA, i - unTarget);
-#elif _M_IX86
-								pTargetBCA = pTargetBCD->m_pClassHierarchyDescriptor->m_pBaseClassArray;
-								pSourceInTargetBCD = pTargetBCA->m_pBaseClassDescriptors[i - unTarget];
+								const auto& pTargetCHD = __GetClassHierarchyDescriptor(pBaseAddress, pTargetBCD);
+#else
+								const auto& pTargetCHD = __GetClassHierarchyDescriptor(pTargetBCD);
 #endif
+								if (!pTargetCHD) {
+									return nullptr;
+								}
+
+#ifdef _M_X64
+								const auto& pTargetBCA = __GetBaseClassArray(pBaseAddress, pTargetCHD);
+#else
+								const auto& pTargetBCA = __GetBaseClassArray(pTargetCHD);
+#endif
+								if (!pTargetBCA) {
+									return nullptr;
+								}
+
+#ifdef _M_X64
+								const auto& pSourceInTargetBCD = __GetBaseClassDescriptor(pBaseAddress, pTargetBCA, i - unTargetIndex);
+#else
+								const auto& pSourceInTargetBCD = __GetBaseClassDescriptor(pTargetBCA, i - unTargetIndex);
+#endif
+								if (!pSourceInTargetBCD) {
+									return nullptr;
+								}
 
 								if (pSourceInTargetBCD->m_unAttributes & BCD_NOTVISIBLE) {
 									bDownCastAllowed = false;
@@ -3591,81 +4127,243 @@ namespace Detours {
 			return nullptr;
 		}
 
+		// ----------------------------------------------------------------
+		// RT functions
+		// ----------------------------------------------------------------
+
 #ifdef _M_X64
-		void const* const __RTDynamicCast(void const* const pBaseAddress, void const* const pAddress, const LONG nOffset, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pDestinationTypeDescriptor) {
+		void* const RTDynamicCast(void const* const pBaseAddress, void* const pAddress, const LONG nVfDelta, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor, const BOOL bIsReference) {
 #elif _M_IX86
-		void const* const __RTDynamicCast(void const* const pAddress, const LONG nOffset, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pDestinationTypeDescriptor) {
+		void* const RTDynamicCast(void* const pAddress, const LONG nVfDelta, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor, const BOOL bIsReference) {
 #endif
 #ifdef _M_X64
-			if (!pBaseAddress || !pAddress || !pSourceTypeDescriptor || !pDestinationTypeDescriptor) {
-#elif _M_IX86
-			if (!pAddress || !pSourceTypeDescriptor || !pDestinationTypeDescriptor) {
+			if (!pBaseAddress || !pAddress || !pSourceTypeDescriptor || !pTargetTypeDescriptor) {
+#else
+			if (!pAddress || !pSourceTypeDescriptor || !pTargetTypeDescriptor) {
 #endif
 				return nullptr;
 			}
 
-			const auto& pCO = FindCompleteObject(pAddress);
-			if (!pCO) {
-				return nullptr;
-			}
+			void* pResult = nullptr;
 
-			const auto& pCOL = GetCompleteObjectLocatorFromObject(pAddress);
-			if (!pCOL) {
-				return nullptr;
-			}
+			__try {
+				LONG nResolvedVfDelta = nVfDelta;
+				if (!nResolvedVfDelta) {
+					nResolvedVfDelta = GuessVfDelta(pAddress);
+				}
+
+				void* const pCompleteObject = FindCompleteObject(pAddress, nResolvedVfDelta);
+				if (!pCompleteObject) {
+					if (bIsReference) {
+						throw std::bad_cast();
+					}
+
+					return nullptr;
+				}
+
+				const auto& pCompleteObjectLocator = GetCompleteObjectLocatorFromObject(pAddress, nResolvedVfDelta);
+				if (!pCompleteObjectLocator || !IsValidCompleteObjectLocator(pCompleteObjectLocator)) {
+					if (bIsReference) {
+						throw std::bad_cast();
+					}
+
+					return nullptr;
+				}
+
+				const ptrdiff_t nSourceOffset = reinterpret_cast<const char*>(pAddress) - reinterpret_cast<const char*>(pCompleteObject);
 
 #ifdef _M_X64
-			const auto& pCHD = reinterpret_cast<PRTTI_CLASS_HIERARCHY_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pCOL->m_unClassHierarchyDescriptor);
+				const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pBaseAddress, pCompleteObjectLocator);
 #elif _M_IX86
-			const auto& pCHD = pCOL->m_pClassHierarchyDescriptor;
+				const auto& pClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pCompleteObjectLocator);
 #endif
-			if (!pCHD) {
-				return nullptr;
-			}
+				if (!pClassHierarchyDescriptor) {
+					if (bIsReference) {
+						throw std::bad_cast();
+					}
 
-			PRTTI_BASE_CLASS_DESCRIPTOR pBCD = nullptr;
+					return nullptr;
+				}
 
-			const unsigned int unAttributes = pCHD->m_unAttributes;
-			if (!(unAttributes & CHD_MULTINH)) {
+				if (!(pClassHierarchyDescriptor->m_unAttributes & CHD_MULTINH)) {
 #ifdef _M_X64
-				pBCD = FindSITargetTypeInstance(pBaseAddress, pCOL, pSourceTypeDescriptor, pDestinationTypeDescriptor);
+					const auto& pBCD = FindSITargetTypeInstance(pBaseAddress, pCompleteObjectLocator, pSourceTypeDescriptor, pTargetTypeDescriptor);
 #elif _M_IX86
-				pBCD = FindSITargetTypeInstance(pCOL, pSourceTypeDescriptor, pDestinationTypeDescriptor);
+					const auto& pBCD = FindSITargetTypeInstance(pCompleteObjectLocator, pSourceTypeDescriptor, pTargetTypeDescriptor);
 #endif
-			} else {
-				const size_t unOffset = reinterpret_cast<size_t>(pAddress) - nOffset - reinterpret_cast<size_t>(pCO);
+					if (pBCD) {
+						pResult = reinterpret_cast<char*>(pCompleteObject) + PMDtoOffset(pCompleteObject, pBCD->m_Where);
+					} else {
+						if (bIsReference) {
+							throw std::bad_cast();
+						}
 
-				if (!(unAttributes & CHD_VIRTINH)) {
+						pResult = nullptr;
+					}
+				} else if (!(pClassHierarchyDescriptor->m_unAttributes & CHD_VIRTINH)) {
 #ifdef _M_X64
-					pBCD = FindMITargetTypeInstance(pBaseAddress, pCO, pCOL, pSourceTypeDescriptor, unOffset, pDestinationTypeDescriptor);
+					const auto& pBCD = FindMITargetTypeInstance(pBaseAddress, pCompleteObject, pCompleteObjectLocator, pSourceTypeDescriptor, nSourceOffset, pTargetTypeDescriptor);
 #elif _M_IX86
-					pBCD = FindMITargetTypeInstance(pCO, pCOL, pSourceTypeDescriptor, unOffset, pDestinationTypeDescriptor);
+					const auto& pBCD = FindMITargetTypeInstance(pCompleteObject, pCompleteObjectLocator, pSourceTypeDescriptor, nSourceOffset, pTargetTypeDescriptor);
 #endif
+					if (pBCD) {
+						pResult = reinterpret_cast<char*>(pCompleteObject) + PMDtoOffset(pCompleteObject, pBCD->m_Where);
+					} else {
+						if (bIsReference) {
+							throw std::bad_cast();
+						}
+
+						pResult = nullptr;
+					}
 				} else {
 #ifdef _M_X64
-					pBCD = FindVITargetTypeInstance(pBaseAddress, pCO, pCOL, pSourceTypeDescriptor, unOffset, pDestinationTypeDescriptor);
+					const auto& pBCD = FindVITargetTypeInstance(pBaseAddress, pCompleteObject, pCompleteObjectLocator, pSourceTypeDescriptor, nSourceOffset, pTargetTypeDescriptor);
 #elif _M_IX86
-					pBCD = FindVITargetTypeInstance(pCO, pCOL, pSourceTypeDescriptor, unOffset, pDestinationTypeDescriptor);
+					const auto& pBCD = FindVITargetTypeInstance(pCompleteObject, pCompleteObjectLocator, pSourceTypeDescriptor, nSourceOffset, pTargetTypeDescriptor);
 #endif
+					if (pBCD) {
+						pResult = reinterpret_cast<char*>(pCompleteObject) + PMDtoOffset(pCompleteObject, pBCD->m_Where);
+					} else {
+						if (bIsReference) {
+							throw std::bad_cast();
+						}
+
+						pResult = nullptr;
+					}
 				}
+			} __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+				pResult = nullptr;
 			}
 
-			if (!pBCD) {
+			return pResult;
+		}
+
+		void* const RTCastToVoid(void* const pAddress) {
+			if (!pAddress) {
 				return nullptr;
 			}
 
-			return reinterpret_cast<void*>(reinterpret_cast<size_t>(pCO) + PMDtoOffset(pCO, pBCD->m_Where));
+			__try {
+				const LONG nVfDelta = GuessVfDelta(pAddress);
+				return FindCompleteObject(pAddress, nVfDelta);
+			} __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+				throw std::runtime_error("Access violation - no RTTI data!");
+			}
 		}
 
-		void const* const Object::DynamicCast(void const* const pAddress, const Object* pObject) {
+#ifdef _M_X64
+		const PRTTI_TYPE_DESCRIPTOR RTtypeid(void const* const pBaseAddress, void* const pAddress) {
+#elif _M_IX86
+		const PRTTI_TYPE_DESCRIPTOR RTtypeid(void* const pAddress) {
+#endif
+#ifdef _M_X64
+			if (!pBaseAddress || !pAddress) {
+#elif _M_IX86
+			if (!pAddress) {
+#endif
+				throw std::bad_typeid();
+			}
+
+			__try {
+				const LONG nVfDelta = GuessVfDelta(pAddress);
+				const auto& pCompleteObjectLocator = GetCompleteObjectLocatorFromObject(pAddress, nVfDelta);
+				if (!pCompleteObjectLocator || !IsValidCompleteObjectLocator(pCompleteObjectLocator)) {
+					throw std::runtime_error("Bad read pointer - no RTTI data!");
+				}
+
+#ifdef _M_X64
+				const auto& pTypeDescriptor = __GetTypeDescriptor(pBaseAddress, pCompleteObjectLocator);
+#elif _M_IX86
+				const auto& pTypeDescriptor = __GetTypeDescriptor(pCompleteObjectLocator);
+#endif
+				if (pTypeDescriptor) {
+					return pTypeDescriptor;
+				}
+
+				throw std::runtime_error("Bad read pointer - no RTTI data!");
+			} __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+				throw std::runtime_error("Access violation - no RTTI data!");
+			}
+		}
+
+		// ----------------------------------------------------------------
+		// Object
+		// ----------------------------------------------------------------
+
+		Object::Object(void const* const pBaseAddress, void const* const pAddress, const size_t unSize, const PRTTI_TYPE_DESCRIPTOR pTypeDescriptor, const PRTTI_CLASS_HIERARCHY_DESCRIPTOR pClassHierarchyDescriptor, const PRTTI_BASE_CLASS_ARRAY pBaseClassArray, const PRTTI_COMPLETE_OBJECT_LOCATOR pCompleteObject, void** pVTable) : m_pBaseAddress(pBaseAddress), m_pAddress(pAddress), m_unSize(unSize), m_pTypeDescriptor(pTypeDescriptor), m_pClassHierarchyDescriptor(pClassHierarchyDescriptor), m_pBaseClassArray(pBaseClassArray), m_pCompleteObject(pCompleteObject) {
+			m_pVTable = pVTable;
+
+			if (!pBaseClassArray || !pClassHierarchyDescriptor) {
+				return;
+			}
+
+			const unsigned int unNumberOfBaseClasses = pClassHierarchyDescriptor->m_unNumberOfBaseClasses;
+
+			for (unsigned int i = 0; i < unNumberOfBaseClasses; ++i) {
+#ifdef _M_X64
+				const auto& pBaseClassDescriptor = __GetBaseClassDescriptor(pBaseAddress, pBaseClassArray, i);
+#elif _M_IX86
+				const auto& pBaseClassDescriptor = __GetBaseClassDescriptor(pBaseClassArray, i);
+#endif
+				if (!pBaseClassDescriptor) {
+					break;
+				}
+
+#ifdef _M_X64
+				const auto& pCurrentTypeDescriptor = __GetTypeDescriptor(pBaseAddress, pBaseClassDescriptor);
+#elif _M_IX86
+				const auto& pCurrentTypeDescriptor = __GetTypeDescriptor(pBaseClassDescriptor);
+#endif
+				if (!pCurrentTypeDescriptor) {
+					continue;
+				}
+
+				PRTTI_CLASS_HIERARCHY_DESCRIPTOR pCurrentClassHierarchyDescriptor = nullptr;
+				PRTTI_BASE_CLASS_ARRAY pCurrentBaseClassArray = nullptr;
+
+				if (pBaseClassDescriptor->m_unAttributes & BCD_HASPCHD) {
+#ifdef _M_X64
+					pCurrentClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pBaseAddress, pBaseClassDescriptor);
+					if (pCurrentClassHierarchyDescriptor) {
+						pCurrentBaseClassArray = __GetBaseClassArray(pBaseAddress, pCurrentClassHierarchyDescriptor);
+					}
+#elif _M_IX86
+					pCurrentClassHierarchyDescriptor = __GetClassHierarchyDescriptor(pBaseClassDescriptor);
+					if (pCurrentClassHierarchyDescriptor) {
+						pCurrentBaseClassArray = __GetBaseClassArray(pCurrentClassHierarchyDescriptor);
+					}
+#endif
+				}
+
+				if (IsTypeDescriptorEqual(pCurrentTypeDescriptor, pTypeDescriptor)) {
+					continue;
+				}
+
+				auto pBaseObject = FindObject(pBaseAddress, pAddress, unSize, pCurrentTypeDescriptor->m_szName);
+				if (!pBaseObject) {
+					pBaseObject = FindObject(pBaseAddress, pAddress, unSize, pCurrentTypeDescriptor->m_szName, nullptr, false);
+					if (!pBaseObject) {
+						m_vecBaseClasses.emplace_back(std::make_unique<Object>(pBaseAddress, pAddress, unSize, pCurrentTypeDescriptor, pCurrentClassHierarchyDescriptor, pCurrentBaseClassArray, nullptr, nullptr));
+						continue;
+					}
+				}
+
+				m_vecBaseClasses.emplace_back(std::move(pBaseObject));
+			}
+		}
+
+		void const* const Object::DynamicCast(void const* const pAddress, const Object* const pObject) {
 			if (!pAddress || !pObject) {
 				return nullptr;
 			}
 
+			const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor = GetTypeDescriptor();
+			const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor = pObject->GetTypeDescriptor();
+
 #ifdef _M_X64
-			return __RTDynamicCast(m_pBaseAddress, pAddress, 0, m_pTypeDescriptor, pObject->GetTypeDescriptor());
+			return RTDynamicCast(m_pBaseAddress, const_cast<void*>(pAddress), 0, pSourceTypeDescriptor, pTargetTypeDescriptor, FALSE);
 #elif _M_IX86
-			return __RTDynamicCast(pAddress, 0, m_pTypeDescriptor, pObject->GetTypeDescriptor());
+			return RTDynamicCast(const_cast<void*>(pAddress), 0, pSourceTypeDescriptor, pTargetTypeDescriptor, FALSE);
 #endif
 		}
 
@@ -3690,10 +4388,32 @@ namespace Detours {
 		}
 
 		// ----------------------------------------------------------------
+		// HasBaseClass
+		// ----------------------------------------------------------------
+
+		static inline bool HasBaseClass(Object* pObject, const char* szParentName) {
+			if (!pObject || !szParentName) {
+				return false;
+			}
+
+			for (const auto& pBase : pObject->GetBaseObjects()) {
+				if (strncmp(pBase->GetTypeDescriptor()->m_szName, szParentName, 0x1000) == 0) {
+					return true;
+				}
+
+				//if (HasBaseClass(pBase.get(), szParentName)) {
+				//	return true;
+				//}
+			}
+
+			return false;
+		}
+
+		// ----------------------------------------------------------------
 		// FindObject
 		// ----------------------------------------------------------------
 
-		std::unique_ptr<Object> FindObject(void const* const pBaseAddress, void const* const pAddress, const size_t unSize, char const* const szName, bool bCompleteObject) {
+		std::unique_ptr<Object> FindObject(void const* const pBaseAddress, void const* const pAddress, const size_t unSize, char const* const szName, const char* szParentName, bool bCompleteObject, unsigned int unOffset) {
 			if (!pBaseAddress || !pAddress || !unSize || !szName) {
 				return nullptr;
 			}
@@ -3731,7 +4451,7 @@ namespace Detours {
 					}
 
 					if (bCompleteObject) {
-						const auto& pCompleteObjectLocator = reinterpret_cast<PRTTI_COMPLETE_OBJECT_LOCATOR>(reinterpret_cast<char*>(pTypeDescriptorReference) - sizeof(int) * 3);
+						const auto& pCompleteObjectLocator =reinterpret_cast<PRTTI_COMPLETE_OBJECT_LOCATOR>(reinterpret_cast<char*>(pTypeDescriptorReference) - sizeof(int) * 3);
 						if ((pCompleteObjectLocator->m_unSignature != COL_SIG_REV0) && (pCompleteObjectLocator->m_unSignature != COL_SIG_REV1)) {
 							pTypeDescriptorReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pTypeDescriptorReference) + 1);
 							continue;
@@ -3745,6 +4465,11 @@ namespace Detours {
 							}
 						}
 #endif
+
+						if (pCompleteObjectLocator->m_unOffset != unOffset) {
+							pTypeDescriptorReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pTypeDescriptorReference) + 1);
+							continue;
+						}
 
 #ifdef _M_X64
 						const auto& pClassHierarchyDescriptor = reinterpret_cast<PRTTI_CLASS_HIERARCHY_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pCompleteObjectLocator->m_unClassHierarchyDescriptor);
@@ -3791,11 +4516,40 @@ namespace Detours {
 									return nullptr;
 								}
 
-								return std::make_unique<Object>(pBaseAddress, pAddress, unSize, pTypeDescriptor, pClassHierarchyDescriptor, pBaseClassArray, pCompleteObjectLocator, reinterpret_cast<void**>(reinterpret_cast<char*>(pCompleteObjectLocatorReference) + sizeof(void*)));
+								auto pCandidate = std::make_unique<Object>(pBaseAddress, pAddress, unSize, pTypeDescriptor, pClassHierarchyDescriptor, pBaseClassArray, pCompleteObjectLocator, reinterpret_cast<void**>(reinterpret_cast<char*>(pCompleteObjectLocatorReference) + sizeof(void*)));
+								if (szParentName && !HasBaseClass(pCandidate.get(), szParentName)) {
+									pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+									continue;
+								}
+
+								return pCandidate;
 							}
 						}
 					} else {
-						const auto& pBaseClassDescriptor = reinterpret_cast<PRTTI_BASE_CLASS_DESCRIPTOR>(pTypeDescriptorReference);
+#ifdef _M_X64
+						const auto& pBaseClassDescriptor = reinterpret_cast<PRTTI_BASE_CLASS_DESCRIPTOR>(reinterpret_cast<char*>(pTypeDescriptorReference) - offsetof(RTTI_BASE_CLASS_DESCRIPTOR, m_unTypeDescriptor));
+#elif _M_IX86
+						const auto& pBaseClassDescriptor = reinterpret_cast<PRTTI_BASE_CLASS_DESCRIPTOR>(reinterpret_cast<char*>(pTypeDescriptorReference) - offsetof(RTTI_BASE_CLASS_DESCRIPTOR, m_pTypeDescriptor));
+#endif
+						if ((pBaseClassDescriptor < pBaseAddress) || (pBaseClassDescriptor >= pEndAddress)) {
+							pTypeDescriptorReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pTypeDescriptorReference) + 1);
+							continue;
+						}
+
+#ifdef _M_X64
+						if (reinterpret_cast<void*>(reinterpret_cast<size_t>(pBaseAddress) + pBaseClassDescriptor->m_unTypeDescriptor) != pTypeDescriptor) {
+#elif _M_IX86
+						if (pBaseClassDescriptor->m_pTypeDescriptor != pTypeDescriptor) {
+#endif
+							pTypeDescriptorReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pTypeDescriptorReference) + 1);
+							continue;
+						}
+
+						if ((pBaseClassDescriptor->m_unAttributes & BCD_HASPCHD) == 0) {
+							pTypeDescriptorReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pTypeDescriptorReference) + 1);
+							continue;
+						}
+
 #ifdef _M_X64
 						const auto& pClassHierarchyDescriptor = reinterpret_cast<PRTTI_CLASS_HIERARCHY_DESCRIPTOR>(reinterpret_cast<size_t>(pBaseAddress) + pBaseClassDescriptor->m_unClassHierarchyDescriptor);
 #elif _M_IX86
@@ -3826,7 +4580,13 @@ namespace Detours {
 #elif _M_IX86
 						if (pBaseClassDescriptor->m_pTypeDescriptor == pTypeDescriptor) {
 #endif
-							return std::make_unique<Object>(pBaseAddress, pAddress, unSize, pTypeDescriptor, pClassHierarchyDescriptor, pBaseClassArray, nullptr, nullptr);
+							auto pCandidate = std::make_unique<Object>(pBaseAddress, pAddress, unSize, pTypeDescriptor, pClassHierarchyDescriptor, pBaseClassArray, nullptr, nullptr);
+							if (szParentName && !HasBaseClass(pCandidate.get(), szParentName)) {
+								pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+								continue;
+							}
+
+							return pCandidate;
 						}
 					}
 
@@ -3839,11 +4599,11 @@ namespace Detours {
 			return nullptr;
 		}
 
-		std::unique_ptr<Object> FindObject(void const* const pAddress, const size_t unSize, char const* const szName, bool bCompleteObject) {
-			return FindObject(pAddress, pAddress, unSize, szName, bCompleteObject);
+		std::unique_ptr<Object> FindObject(void const* const pAddress, const size_t unSize, char const* const szName, const char* szParentName, bool bCompleteObject, unsigned int unOffset) {
+			return FindObject(pAddress, pAddress, unSize, szName, szParentName, bCompleteObject, unOffset);
 		}
 
-		std::unique_ptr<Object> FindObject(const HMODULE hModule, char const* const szName, bool bCompleteObject) {
+		std::unique_ptr<Object> FindObject(const HMODULE hModule, char const* const szName, const char* szParentName, bool bCompleteObject, unsigned int unOffset) {
 			if (!hModule || !szName) {
 				return nullptr;
 			}
@@ -3852,10 +4612,10 @@ namespace Detours {
 			const auto& pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(hModule) + pDH->e_lfanew);
 			const auto& pOH = &(pNTHs->OptionalHeader);
 
-			return FindObject(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szName, bCompleteObject);
+			return FindObject(reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1, szName, szParentName, bCompleteObject, unOffset);
 		}
 
-		std::unique_ptr<Object> FindObjectA(char const* const szModuleName, char const* const szName, bool bCompleteObject) {
+		std::unique_ptr<Object> FindObjectA(char const* const szModuleName, char const* const szName, const char* szParentName, bool bCompleteObject, unsigned int unOffset) {
 			if (!szModuleName || !szName) {
 				return nullptr;
 			}
@@ -3865,11 +4625,10 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindObject(hModule, szName, bCompleteObject);
+			return FindObject(hModule, szName, szParentName, bCompleteObject, unOffset);
 		}
 
-
-		std::unique_ptr<Object> FindObjectW(wchar_t const* const szModuleName, char const* const szName, bool bCompleteObject) {
+		std::unique_ptr<Object> FindObjectW(wchar_t const* const szModuleName, char const* const szName, const char* szParentName, bool bCompleteObject, unsigned int unOffset) {
 			if (!szModuleName || !szName) {
 				return nullptr;
 			}
@@ -3879,16 +4638,352 @@ namespace Detours {
 				return nullptr;
 			}
 
-			return FindObject(hModule, szName, bCompleteObject);
+			return FindObject(hModule, szName, szParentName, bCompleteObject, unOffset);
 		}
 
 #ifdef _UNICODE
-		std::unique_ptr<Object> FindObject(wchar_t const* const szModuleName, char const* const szName, bool bCompleteObject) {
-			return FindObjectW(szModuleName, szName, bCompleteObject);
+		std::unique_ptr<Object> FindObject(wchar_t const* const szModuleName, char const* const szName, const char* szParentName, bool bCompleteObject, unsigned int unOffset) {
+			return FindObjectW(szModuleName, szName, szParentName, bCompleteObject, unOffset);
 		}
 #else
-		std::unique_ptr<Object> FindObject(char const* const szModuleName, char const* const szName, bool bCompleteObject) {
-			return FindObjectA(szModuleName, szName, bCompleteObject);
+		std::unique_ptr<Object> FindObject(char const* const szModuleName, char const* const szName, const char* szParentName, bool bCompleteObject, unsigned int unOffset) {
+			return FindObjectA(szModuleName, szName, szParentName, bCompleteObject, unOffset);
+		}
+#endif
+
+		// ----------------------------------------------------------------
+		// FindTypeInfo
+		// ----------------------------------------------------------------
+
+		static inline char* FindTypeInfo(void const* const pBegin, void const* const pEnd) {
+			char pEncoded[] = { '\xD1', '\xC0', '\xBE', '\xA9', '\x8B', '\x86', '\x8F', '\x9A', '\xA0', '\x96', '\x91', '\x99', '\x90', '\xBF', '\xBF' }; // Encoded ".?AVtype_info@@" to prevent self-scan
+			char pPattern[sizeof(pEncoded) + 1] = {};
+			for (unsigned i = 0; i < sizeof(pEncoded); ++i) {
+				pPattern[i] = pEncoded[i] ^ 0xFF;
+			}
+
+			return reinterpret_cast<char*>(const_cast<void*>(FindData(const_cast<void*>(pBegin), reinterpret_cast<size_t>(const_cast<char*>(reinterpret_cast<const char*>(pEnd))) - reinterpret_cast<size_t>(const_cast<void*>(pBegin)), reinterpret_cast<const unsigned char* const>(pPattern), strnlen(pPattern, 16))));
+		}
+
+		// ----------------------------------------------------------------
+		// TryEmplaceUniqueByTD
+		// ----------------------------------------------------------------
+
+		static inline void TryEmplaceUniqueByTD(std::vector<std::unique_ptr<Object>>& out, std::unordered_set<const void*>& seenTD, std::unique_ptr<Object> candidate) {
+			if (!candidate) {
+				return;
+			}
+
+			const void* pTD = candidate->GetTypeDescriptor();
+			if (!pTD) {
+				return;
+			}
+
+			if (seenTD.insert(pTD).second) {
+				out.emplace_back(std::move(candidate));
+			}
+		}
+
+		// ----------------------------------------------------------------
+		// BuildObjectFromCOL
+		// ----------------------------------------------------------------
+
+		static std::unique_ptr<Object> BuildObjectFromCOL(void const* const pBaseAddress, void const* const pBegin, void const* const pEnd, const PRTTI_TYPE_DESCRIPTOR pTD) {
+			if (!pBaseAddress || !pBegin || !pEnd || !pTD) {
+				return nullptr;
+			}
+
+			void* pReference = const_cast<void*>(pBegin);
+			while (pReference && (reinterpret_cast<const char*>(pReference) < reinterpret_cast<const char*>(pEnd))) {
+#ifdef _M_X64
+				size_t unTypeDescriptorOffsetTemp = reinterpret_cast<size_t>(pTD) - reinterpret_cast<size_t>(pBaseAddress);
+				unsigned int unTypeDescriptorOffset = *(reinterpret_cast<unsigned int*>(&unTypeDescriptorOffsetTemp));
+				pReference = const_cast<void*>(FindData(pReference, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pReference)), reinterpret_cast<const unsigned char*>(&unTypeDescriptorOffset), sizeof(int)));
+#elif _M_IX86
+				pReference = const_cast<void*>(FindData(pReference, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pReference)), reinterpret_cast<const unsigned char*>(&pTD), sizeof(void*)));
+#endif
+				if (!pReference) {
+					break;
+				}
+
+				const auto& pCOL = reinterpret_cast<PRTTI_COMPLETE_OBJECT_LOCATOR>(reinterpret_cast<char*>(pReference) - static_cast<ptrdiff_t>(sizeof(int) * 3));
+				if (IsValidCompleteObjectLocator(pCOL)) {
+#ifdef _M_X64
+					const auto& pCheckTD = __GetTypeDescriptor(pBaseAddress, pCOL);
+					if (!pCheckTD) {
+						pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+						continue;
+					}
+
+					const auto& pCHD = __GetClassHierarchyDescriptor(pBaseAddress, pCOL);
+					if (!pCHD) {
+						pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+						continue;
+					}
+
+					const auto& pBCA = __GetBaseClassArray(pBaseAddress, pCHD);
+					if (!pBCA) {
+						pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+						continue;
+					}
+#elif _M_IX86
+					const auto& pCheckTD = __GetTypeDescriptor(pCOL);
+					if (!pCheckTD) {
+						pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+						continue;
+					}
+
+					const auto& pCHD = __GetClassHierarchyDescriptor(pCOL);
+					if (!pCHD) {
+						pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+						continue;
+					}
+
+					const auto& pBCA = __GetBaseClassArray(pCHD);
+					if (!pBCA) {
+						pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+						continue;
+					}
+#endif
+
+					if ((pCheckTD == pTD) && pCHD && pBCA) {
+						void** pVTable = nullptr;
+						void* pMetaReference = const_cast<void*>(pBegin);
+						while (pMetaReference && (reinterpret_cast<const char*>(pMetaReference) < reinterpret_cast<const char*>(pEnd))) {
+							pMetaReference = const_cast<void*>(FindData(pMetaReference, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pMetaReference)), reinterpret_cast<const unsigned char*>(&pCOL), sizeof(void*)));
+							if (!pMetaReference) {
+								break;
+							}
+
+							void** pVT = reinterpret_cast<void**>(reinterpret_cast<char*>(pMetaReference) + sizeof(void*));
+							if ((reinterpret_cast<const char*>(pVT) >= reinterpret_cast<const char*>(pBegin)) && (reinterpret_cast<const char*>(pVT) < reinterpret_cast<const char*>(pEnd))) {
+								pVTable = pVT;
+								break;
+							}
+
+							pMetaReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pMetaReference) + 1);
+						}
+
+						return std::make_unique<Object>(pBaseAddress, pBegin, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pBegin)), pTD, pCHD, pBCA, pCOL, pVTable);
+					}
+				}
+
+				pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+			}
+
+			return nullptr;
+		}
+
+		// ----------------------------------------------------------------
+		// BuildObjectFromBCD
+		// ----------------------------------------------------------------
+
+		static std::unique_ptr<Object> BuildObjectFromBCD(void const* const pBaseAddress, void const* const pBegin, void const* const pEnd, const PRTTI_TYPE_DESCRIPTOR pTD) {
+			if (!pBaseAddress || !pBegin || !pEnd || !pTD) {
+				return nullptr;
+			}
+
+			void* pReference = const_cast<void*>(pBegin);
+			while (pReference && (reinterpret_cast<const char*>(pReference) < reinterpret_cast<const char*>(pEnd))) {
+#ifdef _M_X64
+				size_t unTypeDescriptorOffsetTemp = reinterpret_cast<size_t>(pTD) - reinterpret_cast<size_t>(pBaseAddress);
+				unsigned int unTypeDescriptorOffset = *(reinterpret_cast<unsigned int*>(&unTypeDescriptorOffsetTemp));
+				pReference = const_cast<void*>(FindData(pReference, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pReference)), reinterpret_cast<const unsigned char*>(&unTypeDescriptorOffset), sizeof(unsigned int)));
+#elif _M_IX86
+				pReference = const_cast<void*>(FindData(pReference, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pReference)), reinterpret_cast<const unsigned char*>(&pTD), sizeof(void*)));
+#endif
+				if (!pReference) {
+					break;
+				}
+
+#ifdef _M_X64
+				const auto& pBCD = reinterpret_cast<PRTTI_BASE_CLASS_DESCRIPTOR>(reinterpret_cast<char*>(pReference) - offsetof(RTTI_BASE_CLASS_DESCRIPTOR, m_unTypeDescriptor));
+#else
+				const auto& pBCD = reinterpret_cast<PRTTI_BASE_CLASS_DESCRIPTOR>(reinterpret_cast<char*>(pReference) - offsetof(RTTI_BASE_CLASS_DESCRIPTOR, m_pTypeDescriptor));
+#endif
+				if ((reinterpret_cast<const char*>(pBCD) < reinterpret_cast<const char*>(pBegin)) || (reinterpret_cast<const char*>(pBCD) >= reinterpret_cast<const char*>(pEnd))) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+
+#ifdef _M_X64
+				if (reinterpret_cast<void*>(reinterpret_cast<size_t>(pBaseAddress) + pBCD->m_unTypeDescriptor) != pTD) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+#else
+				if (pBCD->m_pTypeDescriptor != pTD) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+#endif
+
+				if ((pBCD->m_unAttributes & BCD_HASPCHD) == 0) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+
+#ifdef _M_X64
+				const auto& pCHD = reinterpret_cast<PRTTI_CLASS_HIERARCHY_DESCRIPTOR>( reinterpret_cast<size_t>(pBaseAddress) + pBCD->m_unClassHierarchyDescriptor);
+#else
+				const auto& pCHD = pBCD->m_pClassHierarchyDescriptor;
+				if (!pCHD) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+#endif
+
+				if ((reinterpret_cast<const char*>(pCHD) < reinterpret_cast<const char*>(pBegin)) || (reinterpret_cast<const char*>(pCHD) >= reinterpret_cast<const char*>(pEnd))) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+
+				if ((pCHD->m_unSignature != COL_SIG_REV0) && (pCHD->m_unSignature != COL_SIG_REV1)) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+
+#ifdef _M_X64
+				const auto& pBCA = reinterpret_cast<PRTTI_BASE_CLASS_ARRAY>(reinterpret_cast<size_t>(pBaseAddress) + pCHD->m_unBaseClassArray);
+#else
+				const auto& pBCA = pCHD->m_pBaseClassArray;
+				if (!pBCA) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+#endif
+
+				if ((reinterpret_cast<const char*>(pBCA) < reinterpret_cast<const char*>(pBegin)) || (reinterpret_cast<const char*>(pBCA) >= reinterpret_cast<const char*>(pEnd))) {
+					pReference = reinterpret_cast<void*>(reinterpret_cast<char*>(pReference) + 1);
+					continue;
+				}
+
+				return std::make_unique<Object>(pBaseAddress, pBegin, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pBegin)), pTD, pCHD, pBCA, nullptr, nullptr);
+			}
+
+			return nullptr;
+		}
+
+		// ----------------------------------------------------------------
+		// EnumerateAllTypeDescriptors
+		// ----------------------------------------------------------------
+
+		static void EnumerateAllTypeDescriptors(void const* const pBaseAddress, void const* const pBegin, void const* const pEnd, std::vector<const RTTI_TYPE_DESCRIPTOR*>& out) {
+			if (!pBaseAddress || !pBegin || !pEnd) return;
+
+			char* pTypeInfoName = FindTypeInfo(pBegin, pEnd);
+			if (!pTypeInfoName) {
+				return;
+			}
+
+			const auto& pTypeInfoTD = reinterpret_cast<PRTTI_TYPE_DESCRIPTOR>(reinterpret_cast<char*>(pTypeInfoName) - sizeof(void*) * 2);
+			if ((reinterpret_cast<const char*>(pTypeInfoTD) < reinterpret_cast<const char*>(pBegin)) || (reinterpret_cast<const char*>(pTypeInfoTD) >= reinterpret_cast<const char*>(pEnd)) || (reinterpret_cast<const char*>(pTypeInfoTD->m_pVFTable) < reinterpret_cast<const char*>(pBegin)) || (reinterpret_cast<const char*>(pTypeInfoTD->m_pVFTable) >= reinterpret_cast<const char*>(pEnd))) {
+				return;
+			}
+
+			void* pTypeInfoVFTable = pTypeInfoTD->m_pVFTable;
+			if (!pTypeInfoVFTable) {
+				return;
+			}
+
+			void* pScan = const_cast<void*>(pBegin);
+			while (pScan && (reinterpret_cast<const char*>(pScan) < reinterpret_cast<const char*>(pEnd))) {
+				pScan = const_cast<void*>(FindData(pScan, static_cast<size_t>(reinterpret_cast<const char*>(pEnd) - reinterpret_cast<const char*>(pScan)), reinterpret_cast<const unsigned char*>(&pTypeInfoVFTable), sizeof(void*)));
+				if (!pScan) {
+					break;
+				}
+
+				const auto& pTD = reinterpret_cast<PRTTI_TYPE_DESCRIPTOR>(pScan);
+				const char* szName = pTD->m_szName;
+				if ((reinterpret_cast<const char*>(szName) >= reinterpret_cast<const char*>(pBegin)) && (reinterpret_cast<const char*>(szName) < reinterpret_cast<const char*>(pEnd))) {
+					out.push_back(pTD);
+				}
+
+				pScan = reinterpret_cast<void*>(reinterpret_cast<char*>(pScan) + sizeof(void*));
+			}
+		}
+
+		// ----------------------------------------------------------------
+		// DumpRTTI
+		// ----------------------------------------------------------------
+
+		std::vector<std::unique_ptr<Object>> DumpRTTI(void const* const pBaseAddress, void const* const pAddress, const size_t unSize) {
+			if (!pBaseAddress || !pAddress || !unSize) {
+				return {};
+			}
+
+			const void* pBegin = pAddress;
+			const void* pEnd = reinterpret_cast<const void*>(reinterpret_cast<const char*>(pAddress) + unSize);
+
+			std::vector<const RTTI_TYPE_DESCRIPTOR*> TDs;
+			EnumerateAllTypeDescriptors(pBaseAddress, pBegin, pEnd, TDs);
+
+			std::vector<std::unique_ptr<Object>> vecResult;
+			std::unordered_set<const void*> seenTD;
+
+			for (const auto& pTD : TDs) {
+				if (!pTD) {
+					continue;
+				}
+
+				auto ObjFull = BuildObjectFromCOL(pBaseAddress, pBegin, pEnd, const_cast<PRTTI_TYPE_DESCRIPTOR>(pTD));
+				if (ObjFull) {
+					TryEmplaceUniqueByTD(vecResult, seenTD, std::move(ObjFull));
+					continue;
+				}
+
+				auto ObjPartial = BuildObjectFromBCD(pBaseAddress, pBegin, pEnd, const_cast<PRTTI_TYPE_DESCRIPTOR>(pTD));
+				TryEmplaceUniqueByTD(vecResult, seenTD, std::move(ObjPartial));
+			}
+
+			return vecResult;
+		}
+
+		std::vector<std::unique_ptr<Object>> DumpRTTI(HMODULE hModule) {
+			if (!hModule) {
+				return {};
+			}
+
+			const auto& pDH = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
+			const auto& pNTHs = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<char*>(hModule) + pDH->e_lfanew);
+			const auto& pOH = &(pNTHs->OptionalHeader);
+
+			return DumpRTTI(reinterpret_cast<void*>(hModule), reinterpret_cast<void*>(hModule), static_cast<size_t>(pOH->SizeOfImage) - 1);
+		}
+
+		std::vector<std::unique_ptr<Object>> DumpRTTIA(char const* const szModulePath) {
+			if (!szModulePath) {
+				return {};
+			}
+
+			HMODULE hModule = GetModuleHandleA(szModulePath);
+			if (!hModule) {
+				return {};
+			}
+
+			return DumpRTTI(hModule);
+		}
+
+		std::vector<std::unique_ptr<Object>> DumpRTTIW(wchar_t const* const szModulePath) {
+			if (!szModulePath) {
+				return {};
+			}
+
+			HMODULE hModule = GetModuleHandleW(szModulePath);
+			if (!hModule) {
+				return {};
+			}
+
+			return DumpRTTI(hModule);
+		}
+
+#ifdef _UNICODE
+		std::vector<std::unique_ptr<Object>> DumpRTTI(wchar_t const* const szModulePath) {
+			return DumpRTTIW(szModulePath);
+		}
+#else
+		std::vector<std::unique_ptr<Object>> DumpRTTI(char const* const szModulePath) {
+			return DumpRTTIA(szModulePath);
 		}
 #endif
 	}
@@ -4527,12 +5622,12 @@ namespace Detours {
 		// CriticalSection
 		// ----------------------------------------------------------------
 
-		CriticalSection::CriticalSection() {
-			InitializeCriticalSection(&m_CriticalSection);
-		}
-
 		CriticalSection::CriticalSection(DWORD unSpinCount) {
-			InitializeCriticalSectionAndSpinCount(&m_CriticalSection, unSpinCount);
+			if (!unSpinCount) {
+				InitializeCriticalSection(&m_CriticalSection);
+			} else {
+				UNREFERENCED_PARAMETER(InitializeCriticalSectionAndSpinCount(&m_CriticalSection, unSpinCount));
+			}
 		}
 
 		CriticalSection::~CriticalSection() {
@@ -4549,91 +5644,6 @@ namespace Detours {
 
 		void CriticalSection::Leave() {
 			LeaveCriticalSection(&m_CriticalSection);
-		}
-
-		// ----------------------------------------------------------------
-		// SRWLock
-		// ----------------------------------------------------------------
-
-		SRWLock::SRWLock(bool bIsShared) {
-			m_bIsShared = bIsShared;
-			InitializeSRWLock(&m_SRWLock);
-		}
-
-		SRWLock::~SRWLock() {
-			Release();
-		}
-
-		bool SRWLock::IsShared() const {
-			return m_bIsShared;
-		}
-
-		PSRWLOCK SRWLock::GetSRWLock() {
-			return &m_SRWLock;
-		}
-
-		void SRWLock::Acquire() {
-			if (m_bIsShared) {
-				AcquireSRWLockShared(&m_SRWLock);
-			} else {
-				AcquireSRWLockExclusive(&m_SRWLock);
-			}
-		}
-
-		void SRWLock::Release() {
-			if (m_bIsShared) {
-				ReleaseSRWLockShared(&m_SRWLock);
-			} else {
-				AcquireSRWLockExclusive(&m_SRWLock);
-			}
-		}
-
-		// ----------------------------------------------------------------
-		// ConditionVariable
-		// ----------------------------------------------------------------
-
-		ConditionVariable::ConditionVariable() {
-			InitializeConditionVariable(&m_ConditionVariable);
-		}
-
-		ConditionVariable::~ConditionVariable() {
-			WakeAll();
-		}
-
-		CONDITION_VARIABLE ConditionVariable::GetConditionVariable() const {
-			return m_ConditionVariable;
-		}
-
-		bool ConditionVariable::Sleep(CriticalSection* pLock, DWORD unMilliseconds) {
-			if (!pLock) {
-				return false;
-			}
-
-			if (!SleepConditionVariableCS(&m_ConditionVariable, pLock->GetCriticalSection(), unMilliseconds)) {
-				return false;
-			}
-
-			return true;
-		}
-
-		bool ConditionVariable::Sleep(SRWLock* pLock, DWORD unMilliseconds) {
-			if (!pLock) {
-				return false;
-			}
-
-			if (!SleepConditionVariableSRW(&m_ConditionVariable, pLock->GetSRWLock(), unMilliseconds, pLock->IsShared() ? CONDITION_VARIABLE_LOCKMODE_SHARED : 0)) {
-				return false;
-			}
-
-			return true;
-		}
-
-		void ConditionVariable::Wake() {
-			WakeConditionVariable(&m_ConditionVariable);
-		}
-
-		void ConditionVariable::WakeAll() {
-			WakeAllConditionVariable(&m_ConditionVariable);
 		}
 
 		// ----------------------------------------------------------------
@@ -4675,9 +5685,11 @@ namespace Detours {
 
 			do {
 				if ((pTEB->ClientId.UniqueProcess == te.th32OwnerProcessID) && (pTEB->ClientId.UniqueThread != te.th32ThreadID)) {
-					HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+					HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
 					if (hThread && (hThread != INVALID_HANDLE_VALUE)) {
-						SuspendThread(hThread);
+						if (SuspendThread(hThread) == static_cast<DWORD>(-1)) {
+							continue;
+						}
 
 						CONTEXT ctx;
 						memset(&ctx, 0, sizeof(CONTEXT));
@@ -4715,7 +5727,56 @@ namespace Detours {
 			m_Threads.clear();
 		}
 
+		bool Suspender::IsRegionExecuting(void* pAddress, size_t unSize) {
+			if (!pAddress || !unSize) {
+				return false;
+			}
+
+			for (auto& thread : m_Threads) {
+#ifdef _M_X64
+				void* pIP = reinterpret_cast<void*>(thread.m_CTX.Rip);
+#elif _M_IX86
+				void* pIP = reinterpret_cast<void*>(thread.m_CTX.Eip);
+#endif
+				if ((pIP >= pAddress) && (pIP < (reinterpret_cast<char*>(pAddress) + unSize))) {
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		bool Suspender::IsRegionInCallStacks(void* pAddress, size_t unSize) {
+			if (!pAddress || !unSize) {
+				return false;
+			}
+
+			for (auto& thread : m_Threads) {
+				auto vecShadowCallStack = GetShadowCallStack(thread.m_hHandle);
+				for (const auto& ReturnAddress : vecShadowCallStack) {
+					if ((ReturnAddress >= pAddress) && (ReturnAddress < (reinterpret_cast<char*>(pAddress) + unSize))) {
+						return true;
+					}
+				}
+
+				if (vecShadowCallStack.empty()) {
+					auto vecCallStack = GetCallStack(thread.m_hHandle);
+					for (const auto& ReturnAddress : vecCallStack) {
+						if ((ReturnAddress >= pAddress) && (ReturnAddress < (reinterpret_cast<char*>(pAddress) + unSize))) {
+							return true;
+						}
+					}
+				}
+			}
+
+			return false;
+		}
+
 		void Suspender::FixExecutionAddress(void* pAddress, void* pNewAddress) {
+			if (!pAddress || pNewAddress) {
+				return;
+			}
+
 			for (auto& thread : m_Threads) {
 #ifdef _M_X64
 				DWORD64 unIP = thread.m_CTX.Rip;
@@ -4982,28 +6043,14 @@ namespace Detours {
 
 	namespace Parallel {
 
-		/*
-		// ----------------------------------------------------------------
-		// Thread Data
-		// ----------------------------------------------------------------
-
-		typedef struct _THREAD_DATA {
-			void* m_pParameter;
-		} THREAD_DATA, *PTHREAD_DATA;
-
 		// ----------------------------------------------------------------
 		// Thread Routine
 		// ----------------------------------------------------------------
 
-		DWORD WINAPI ThreadRoutine(PVOID lpThreadParameter) {
-			auto pTD = reinterpret_cast<PTHREAD_DATA>(lpThreadParameter);
-			if (!pTD) {
-				return EXIT_SUCCESS;
-			}
-
-			auto pThread = static_cast<Thread*>(pTD->m_pParameter);
+		DWORD WINAPI ThreadRoutine(PVOID lpParameter) {
+			auto pThread = static_cast<Thread*>(lpParameter);
 			if (!pThread) {
-				return EXIT_SUCCESS;
+				return EXIT_FAILURE;
 			}
 
 			auto pCallback = pThread->GetCallBack();
@@ -5065,16 +6112,7 @@ namespace Detours {
 				return false;
 			}
 
-			auto pTD = std::make_unique<THREAD_DATA>();
-			if (!pTD) {
-				return false;
-			}
-
-			memset(pTD.get(), 0, sizeof(THREAD_DATA));
-
-			pTD->m_pParameter = this;
-
-			m_hThread = CreateThread(nullptr, NULL, ThreadRoutine, pTD.get(), NULL, nullptr);
+			m_hThread = CreateThread(nullptr, NULL, ThreadRoutine, this, NULL, nullptr);
 			if (!m_hThread || (m_hThread == INVALID_HANDLE_VALUE)) {
 				return false;
 			}
@@ -5088,6 +6126,20 @@ namespace Detours {
 			}
 
 			if (WaitForSingleObject(m_hThread, INFINITE) != WAIT_OBJECT_0) {
+				return false;
+			}
+
+			DWORD unExitCode = EXIT_SUCCESS;
+			if (!GetExitCodeThread(m_hThread, &unExitCode)) {
+				CloseHandle(m_hThread);
+				m_hThread = nullptr;
+				return false;
+			}
+
+			CloseHandle(m_hThread);
+			m_hThread = nullptr;
+
+			if (unExitCode != EXIT_SUCCESS) {
 				return false;
 			}
 
@@ -5125,7 +6177,6 @@ namespace Detours {
 		void* Thread::GetData() const {
 			return m_pData;
 		}
-		*/
 
 		// ----------------------------------------------------------------
 		// Fiber Data
@@ -5254,6 +6305,191 @@ namespace Detours {
 	namespace Memory {
 
 		// ----------------------------------------------------------------
+		// PAGE_INFO
+		// ----------------------------------------------------------------
+
+		typedef struct _PAGE_INFO {
+			void* m_pBaseAddress;
+			size_t m_unSize;
+			DWORD m_unState;
+			DWORD m_unProtection;
+			DWORD m_unType;
+		} PAGE_INFO, *PPAGE_INFO;
+
+		// ----------------------------------------------------------------
+		// REGION_INFO
+		// ----------------------------------------------------------------
+
+		typedef struct _REGION_INFO {
+			void* m_pBaseAddress;
+			size_t m_unSize;
+			DWORD m_unState;
+			DWORD m_unProtection;
+			DWORD m_unType;
+		} REGION_INFO, *PREGION_INFO;
+
+		// ----------------------------------------------------------------
+		// __get_page_info
+		// ----------------------------------------------------------------
+
+		static void* pMinimumApplicationAddress = nullptr;
+		static void* pMaximumApplicationAddress = nullptr;
+		static DWORD unPageSize = 0;
+		static DWORD unAllocationGranularity = 0;
+
+		static bool inline __get_page_info(void* pAddress, PPAGE_INFO pPageInfo) {
+			if (!pAddress) {
+				return false;
+			}
+
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
+				SYSTEM_INFO sysinf;
+				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
+				unPageSize = sysinf.dwPageSize;
+				unAllocationGranularity = sysinf.dwAllocationGranularity;
+			}
+
+			MEMORY_BASIC_INFORMATION mbi;
+			memset(&mbi, 0, sizeof(mbi));
+			if (VirtualQuery(pAddress, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+				return false;
+			}
+
+			if (pPageInfo) {
+				memset(pPageInfo, 0, sizeof(PAGE_INFO));
+
+				pPageInfo->m_pBaseAddress = mbi.BaseAddress;
+				pPageInfo->m_unSize = unPageSize;
+				pPageInfo->m_unState = mbi.State;
+				pPageInfo->m_unProtection = mbi.Protect;
+				pPageInfo->m_unType = mbi.Type;
+			}
+
+			return true;
+		};
+
+		// ----------------------------------------------------------------
+		// __get_region_info
+		// ----------------------------------------------------------------
+
+		static bool inline __get_region_info(void* pAddress, PREGION_INFO pRegionInfo) {
+			if (!pAddress) {
+				return false;
+			}
+
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
+				SYSTEM_INFO sysinf;
+				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
+				unPageSize = sysinf.dwPageSize;
+				unAllocationGranularity = sysinf.dwAllocationGranularity;
+			}
+
+			MEMORY_BASIC_INFORMATION mbi;
+			memset(&mbi, 0, sizeof(mbi));
+			if (VirtualQuery(pAddress, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+				return false;
+			}
+
+			if (pRegionInfo) {
+				memset(pRegionInfo, 0, sizeof(REGION_INFO));
+
+				pRegionInfo->m_pBaseAddress = mbi.BaseAddress;
+				pRegionInfo->m_unSize = mbi.RegionSize;
+				pRegionInfo->m_unState = mbi.State;
+				pRegionInfo->m_unProtection = mbi.Protect;
+				pRegionInfo->m_unType = mbi.Type;
+			}
+
+			return true;
+		};
+
+		// ----------------------------------------------------------------
+		// __get_pages_info
+		// ----------------------------------------------------------------
+
+		static inline std::vector<PAGE_INFO> __get_pages_info(void* pAddress, size_t unSize, bool bUnLimitBounds = false) {
+			std::vector<PAGE_INFO> vecPages;
+			if (!pAddress || !unSize) {
+				return vecPages;
+			}
+
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
+				SYSTEM_INFO sysinf;
+				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
+				unPageSize = sysinf.dwPageSize;
+				unAllocationGranularity = sysinf.dwAllocationGranularity;
+			}
+
+			const size_t unBegin = !bUnLimitBounds ? MAX(reinterpret_cast<size_t>(pMinimumApplicationAddress), reinterpret_cast<size_t>(pAddress)) : reinterpret_cast<size_t>(pAddress);
+			const size_t unEnd = !bUnLimitBounds ? MIN(reinterpret_cast<size_t>(pMaximumApplicationAddress), reinterpret_cast<size_t>(pAddress) + unSize) : reinterpret_cast<size_t>(pAddress) + unSize;
+
+			PAGE_INFO pi;
+			memset(&pi, 0, sizeof(pi));
+
+			for (size_t unAddress = unBegin; unAddress < unEnd; unAddress = __align_up(MIN(unAddress, reinterpret_cast<size_t>(pi.m_pBaseAddress)) + pi.m_unSize, static_cast<size_t>(unPageSize))) {
+				if (!__get_page_info(reinterpret_cast<void*>(unAddress), &pi)) {
+					break;
+				}
+
+				vecPages.emplace_back(pi);
+			}
+
+			return vecPages;
+		};
+
+		// ----------------------------------------------------------------
+		// __get_regions_info
+		// ----------------------------------------------------------------
+
+		static inline std::vector<REGION_INFO> __get_regions_info(void* pAddress, size_t unSize, bool bCombine = false, bool bUnLimitBounds = false) {
+			std::vector<REGION_INFO> vecRegions;
+			if (!pAddress || !unSize) {
+				return vecRegions;
+			}
+
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
+				SYSTEM_INFO sysinf;
+				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
+				unPageSize = sysinf.dwPageSize;
+				unAllocationGranularity = sysinf.dwAllocationGranularity;
+			}
+
+			const size_t unBegin = !bUnLimitBounds ? MAX(reinterpret_cast<size_t>(pMinimumApplicationAddress), reinterpret_cast<size_t>(pAddress)) : reinterpret_cast<size_t>(pAddress);
+			const size_t unEnd = !bUnLimitBounds ? MIN(reinterpret_cast<size_t>(pMaximumApplicationAddress), reinterpret_cast<size_t>(pAddress) + unSize) : reinterpret_cast<size_t>(pAddress) + unSize;
+
+			REGION_INFO ri;
+			memset(&ri, 0, sizeof(ri));
+
+			for (size_t unAddress = unBegin; unAddress < unEnd; unAddress = __align_up(MIN(unAddress, reinterpret_cast<size_t>(ri.m_pBaseAddress)) + ri.m_unSize, static_cast<size_t>(unAllocationGranularity))) {
+				if (!__get_region_info(reinterpret_cast<void*>(unAddress), &ri)) {
+					break;
+				}
+
+				if (bCombine) {
+					if (!vecRegions.empty()) {
+						auto& LastRegion = vecRegions.back();
+						if (reinterpret_cast<size_t>(LastRegion.m_pBaseAddress) + LastRegion.m_unSize == reinterpret_cast<size_t>(ri.m_pBaseAddress)) {
+							LastRegion.m_unSize += ri.m_unSize;
+							continue;
+						}
+					}
+				}
+
+				vecRegions.emplace_back(ri);
+			}
+
+			return vecRegions;
+		};
+
+		// ----------------------------------------------------------------
 		// __is_relative
 		// ----------------------------------------------------------------
 
@@ -5266,6 +6502,33 @@ namespace Detours {
 
 			return 0;
 		};
+
+		// ----------------------------------------------------------------
+		// __is_in_range
+		// ----------------------------------------------------------------
+
+		static bool inline __is_in_range(void const* const pBeginAddress, const size_t unSize, void const* const pAddress) {
+			if ((pAddress >= pBeginAddress) && ((static_cast<char const* const>(pBeginAddress) + unSize) > pAddress)) {
+				return true;
+			}
+
+			return false;
+		};
+
+		// ----------------------------------------------------------------
+		// __is_range_in_range
+		// ----------------------------------------------------------------
+
+		static bool inline __is_range_in_range(void const* const pOuterRangeStart, const size_t unOuterRangeSize, void const* const pInnerRangeStart, const size_t unInnerRangeSize) {
+			if (!pOuterRangeStart || !pInnerRangeStart) {
+				return false;
+			}
+
+			const char* const pOuterRangeEnd = static_cast<const char* const>(pOuterRangeStart) + unOuterRangeSize;
+			const char* const pInnerRangeEnd = static_cast<const char* const>(pInnerRangeStart) + unInnerRangeSize;
+
+			return (pInnerRangeStart < pOuterRangeEnd) && (pOuterRangeStart < pInnerRangeEnd);
+		}
 
 		// ----------------------------------------------------------------
 		// Shared
@@ -5449,65 +6712,246 @@ namespace Detours {
 		// Page
 		// ----------------------------------------------------------------
 
-		static DWORD unPageSize = 0;
-		static DWORD unAllocationGranularity = 0;
+		Page::Page(void* pBaseAddress, bool bAutoRestore, bool bCommitPage) {
+			m_bIsManualPage = true;
+			m_unPageCapacity = 0;
+			m_pPageAddress = nullptr;
+			m_bAutoRestore = bAutoRestore;
+			m_bCommitted = bCommitPage;
+			m_unOriginalProtection = 0;
 
-		Page::Page(size_t unCapacity) {
-			if (!unPageSize || !unAllocationGranularity) {
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
 				SYSTEM_INFO sysinf;
 				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
 				unPageSize = sysinf.dwPageSize;
 				unAllocationGranularity = sysinf.dwAllocationGranularity;
 			}
 
-			if (!unCapacity) {
-				unCapacity = unPageSize;
-			} else {
-				if (unCapacity < unPageSize) {
-					unCapacity = unPageSize;
-				} else {
-					unCapacity = __align_up(unCapacity, static_cast<size_t>(unAllocationGranularity));
-				}
+			if (!pBaseAddress) {
+				return;
 			}
 
-			m_unCapacity = unCapacity;
-			m_pPageAddress = VirtualAlloc(nullptr, unCapacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+			m_unPageCapacity = unPageSize;
+			if (bCommitPage) {
+				m_pPageAddress = VirtualAlloc(pBaseAddress, unPageSize, MEM_COMMIT, PAGE_READWRITE);
+				if (m_pPageAddress) {
+					m_FreeBlocks.emplace(m_pPageAddress, unPageSize);
+				}
+			} else {
+				PAGE_INFO pi;
+				if (!__get_page_info(pBaseAddress, &pi)) {
+					return;
+				}
+
+				if (pi.m_pBaseAddress != pBaseAddress) {
+					return;
+				}
+
+				m_pPageAddress = pBaseAddress;
+				m_FreeBlocks.emplace(pBaseAddress, pi.m_unSize);
+			}
+
 			if (m_pPageAddress) {
-				m_FreeBlocks.emplace(m_pPageAddress, unCapacity);
+				GetProtection(&m_unOriginalProtection);
+			}
+		}
+
+		Page::Page(void* pDesiredAddress) {
+			m_bIsManualPage = false;
+			m_unPageCapacity = 0;
+			m_pPageAddress = nullptr;
+			m_bAutoRestore = false;
+			m_bCommitted = false;
+			m_unOriginalProtection = 0;
+
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
+				SYSTEM_INFO sysinf;
+				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
+				unPageSize = sysinf.dwPageSize;
+				unAllocationGranularity = sysinf.dwAllocationGranularity;
+			}
+
+			m_unPageCapacity = unPageSize;
+			if (pDesiredAddress) {
+				auto vecBackwardPages = __get_pages_info(reinterpret_cast<char*>(pDesiredAddress) - 0x7FFFFFFF + 1, 0x7FFFFFFF);
+				std::reverse(vecBackwardPages.begin(), vecBackwardPages.end());
+				for (auto& PageInfo : vecBackwardPages) { // [unAddress; unBegin] - From unAddress to unBegin (Backward)
+					if (!__is_relative(pDesiredAddress, PageInfo.m_pBaseAddress)) {
+						continue;
+					}
+
+					if (PageInfo.m_unState == MEM_FREE) {
+						void* pPageAddress = VirtualAlloc(reinterpret_cast<void*>(PageInfo.m_pBaseAddress), PageInfo.m_unSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+						if (pPageAddress) {
+							if (__is_relative(pDesiredAddress, pPageAddress)) {
+								m_pPageAddress = pPageAddress;
+								break;
+							} else {
+								VirtualFree(pPageAddress, 0, MEM_RELEASE);
+							}
+						}
+					}
+				}
+
+				auto vecForwardPages = __get_pages_info(pDesiredAddress, 0x7FFFFFFF);
+				for (auto& PageInfo : vecForwardPages) { // [unAddress; unEnd] - From unAddress to unEnd(Forward)
+					if (!__is_relative(pDesiredAddress, PageInfo.m_pBaseAddress)) {
+						continue;
+					}
+
+					if (PageInfo.m_unState == MEM_FREE) {
+						void* pPageAddress = VirtualAlloc(reinterpret_cast<void*>(PageInfo.m_pBaseAddress), PageInfo.m_unSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+						if (pPageAddress) {
+							if (__is_relative(pDesiredAddress, pPageAddress)) {
+								m_pPageAddress = pPageAddress;
+								break;
+							} else {
+								VirtualFree(pPageAddress, 0, MEM_RELEASE);
+							}
+						}
+					}
+				}
+			} else {
+				m_pPageAddress = VirtualAlloc(nullptr, unPageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+			}
+
+			if (m_pPageAddress) {
+				m_FreeBlocks.emplace(m_pPageAddress, unPageSize);
+				GetProtection(&m_unOriginalProtection);
 			}
 		}
 
 		Page::~Page() {
 			if (m_pPageAddress) {
-				VirtualFree(m_pPageAddress, 0, MEM_RELEASE);
+				if (m_bAutoRestore) {
+					RestoreProtection();
+				}
+
+				if (m_bIsManualPage && m_bCommitted) {
+#pragma warning(push)
+#pragma warning(disable : 6250)
+					VirtualFree(m_pPageAddress, 0, MEM_DECOMMIT);
+#pragma warning(pop)
+				}
+
+				if (!m_bIsManualPage) {
+					VirtualFree(m_pPageAddress, 0, MEM_RELEASE);
+				}
 			}
 		}
 
-		void* Page::Alloc(size_t unSize) {
-			if (!m_pPageAddress || !unSize) {
+		bool Page::GetProtection(const PDWORD pProtection) {
+			if (!m_pPageAddress || !m_unPageCapacity) {
+				return false;
+			}
+
+			PAGE_INFO pi;
+			if (!__get_page_info(m_pPageAddress, &pi)) {
+				return false;
+			}
+
+			if (pProtection) {
+				*pProtection = pi.m_unProtection;
+			}
+
+			return true;
+		}
+
+		bool Page::GetOriginalProtection(const PDWORD pProtection) {
+			if (!m_pPageAddress || !m_unPageCapacity) {
+				return false;
+			}
+
+			if (pProtection) {
+				*pProtection = m_unOriginalProtection;
+			}
+
+			return true;
+		}
+
+		bool Page::ChangeProtection(const DWORD unNewProtection) {
+			if (!m_pPageAddress || !m_unPageCapacity) {
+				return false;
+			}
+
+			DWORD unProtection = 0;
+			if (!VirtualProtect(const_cast<void*>(m_pPageAddress), m_unPageCapacity, unNewProtection, &unProtection)) {
+				return false;
+			}
+
+			if (unNewProtection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) {
+				if (!FlushInstructionCache(reinterpret_cast<HANDLE>(-1), m_pPageAddress, m_unPageCapacity)) {
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		bool Page::RestoreProtection() {
+			if (!m_pPageAddress || !m_unPageCapacity) {
+				return false;
+			}
+
+			if (!ChangeProtection(m_unOriginalProtection)) {
+				return false;
+			}
+
+			return true;
+		}
+
+		void* Page::Alloc(size_t unSize, size_t unSizeAlign, size_t unAddressAlign) {
+			if (!m_pPageAddress || !m_unPageCapacity || !unSize || !unSizeAlign || !unAddressAlign) {
 				return nullptr;
 			}
 
-			for (auto it = m_FreeBlocks.begin(); it != m_FreeBlocks.end(); ++it) {
-				if (it->m_unSize >= unSize) {
-					void* pAddress = it->m_pAddress;
+			const bool bSizeAlign = (unSizeAlign > 1) && !(unSizeAlign & (unSizeAlign - 1));
+			const bool bAddressAlign = (unAddressAlign > 1) && !(unAddressAlign & (unAddressAlign - 1));
 
-					if (it->m_unSize > unSize) {
-						m_FreeBlocks.emplace(reinterpret_cast<char*>(it->m_pAddress) + unSize, it->m_unSize - unSize);
+			for (auto it = m_FreeBlocks.begin(); it != m_FreeBlocks.end(); ++it) {
+				const size_t unAddress = reinterpret_cast<size_t>(it->m_pAddress);
+				const size_t unAddressAlignSize = !bAddressAlign ? 0 : (((unAddress % unAddressAlign == 0) ? 0 : (unAddressAlign - (unAddress % unAddressAlign))));
+
+				const size_t unSizeAlignSize = !bSizeAlign ? 0 : ((unSize % unSizeAlign) == 0) ? 0 : (unSizeAlign - (unSize % unSizeAlign));
+				const size_t unAlignedSize = unSize + unSizeAlignSize;
+
+				if (it->m_unSize >= unAlignedSize + unAddressAlignSize) {
+					void* pAlignedAddress = reinterpret_cast<char*>(unAddress) + unAddressAlignSize;
+
+					if (it->m_unSize > unAlignedSize + unAddressAlignSize) {
+						m_FreeBlocks.emplace(reinterpret_cast<char*>(pAlignedAddress) + unAlignedSize, it->m_unSize - unAlignedSize - unAddressAlignSize);
 					}
 
-					m_ActiveBlocks.emplace(pAddress, unSize);
+					m_ActiveBlocks.emplace(pAlignedAddress, unSize);
 					m_FreeBlocks.erase(it);
 
-					return pAddress;
+					return pAlignedAddress;
 				}
 			}
 
 			return nullptr;
 		}
 
+		void* Page::ZeroAlloc(size_t unSize, size_t unSizeAlign, size_t unAddressAlign) {
+			if (!m_pPageAddress || !m_unPageCapacity || !unSize || !unSizeAlign || !unAddressAlign) {
+				return nullptr;
+			}
+
+			void* pAddress = Alloc(unSize, unSizeAlign, unAddressAlign);
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			memset(pAddress, 0, unSize);
+			return pAddress;
+		}
+
 		bool Page::DeAlloc(void* pAddress) {
-			if (!m_pPageAddress || !pAddress) {
+			if (!m_pPageAddress || !m_unPageCapacity || !pAddress) {
 				return false;
 			}
 
@@ -5523,16 +6967,14 @@ namespace Detours {
 		}
 
 		void Page::DeAllocAll() {
-			if (!m_pPageAddress) {
+			if (!m_pPageAddress || !m_unPageCapacity) {
 				return;
 			}
 
 			m_FreeBlocks.clear();
 			m_ActiveBlocks.clear();
 
-			m_FreeBlocks.emplace(m_pPageAddress, m_unCapacity);
-
-			return;
+			m_FreeBlocks.emplace(m_pPageAddress, m_unPageCapacity);
 		}
 
 		void Page::MergeFreeBlocks() {
@@ -5557,39 +6999,82 @@ namespace Detours {
 			}
 
 			MergedFreeBlocks.insert(PrevBlock);
-			m_FreeBlocks = MergedFreeBlocks;
+			m_FreeBlocks = std::move(MergedFreeBlocks);
 		}
 
-		void* Page::GetAddress() const {
+		void* Page::GetPageAddress() const {
 			return m_pPageAddress;
 		}
 
-		size_t Page::GetCapacity() const {
-			return m_unCapacity;
+		size_t Page::GetPageCapacity() const {
+			return m_unPageCapacity;
 		}
 
-		size_t Page::GetSize() const {
-			size_t unSize = 0;
+		size_t Page::GetDataSize() const {
+			size_t unDataSize = 0;
 
 			for (const auto& block : m_ActiveBlocks) {
-				unSize += block.m_unSize;
+				unDataSize += block.m_unSize;
 			}
 
-			return unSize;
+			return unDataSize;
 		}
 
-		bool Page::IsEmpty() const {
+		bool Page::IsPageEmpty() const {
 			return m_ActiveBlocks.empty();
 		}
 
 		// ----------------------------------------------------------------
-		// NearPage
+		// Region
 		// ----------------------------------------------------------------
 
-		NearPage::NearPage(size_t unCapacity, void* pDesiredAddress) {
-			if (!unPageSize || !unAllocationGranularity) {
+		Region::Region(void* pBaseAddress, bool bAutoRestore) {
+			m_bIsManualRegion = true;
+			m_unRegionCapacity = 0;
+			m_pRegionAddress = nullptr;
+			m_bAutoRestore = bAutoRestore;
+			m_unOriginalProtection = 0;
+			m_unUsedSpace = 0;
+
+			if (!pBaseAddress) {
+				return;
+			}
+
+			REGION_INFO ri;
+			if (!__get_region_info(pBaseAddress, &ri)) {
+				return;
+			}
+
+			if (ri.m_pBaseAddress != pBaseAddress) {
+				return;
+			}
+
+			m_unRegionCapacity = ri.m_unSize;
+			m_pRegionAddress = pBaseAddress;
+
+			auto vecPages = __get_pages_info(pBaseAddress, ri.m_unSize);
+			for (auto& PageInfo : vecPages) {
+				m_Pages.emplace_back(PageInfo.m_pBaseAddress, false);
+			}
+
+			if (!GetProtection(&m_unOriginalProtection)) {
+				return;
+			}
+		}
+
+		Region::Region(void* pDesiredAddress, size_t unCapacity) {
+			m_bIsManualRegion = false;
+			m_unRegionCapacity = 0;
+			m_pRegionAddress = nullptr;
+			m_bAutoRestore = false;
+			m_unOriginalProtection = 0;
+			m_unUsedSpace = 0;
+
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
 				SYSTEM_INFO sysinf;
 				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
 				unPageSize = sysinf.dwPageSize;
 				unAllocationGranularity = sysinf.dwAllocationGranularity;
 			}
@@ -5600,183 +7085,380 @@ namespace Detours {
 				if (unCapacity < unPageSize) {
 					unCapacity = unPageSize;
 				} else {
-					unCapacity = __align_up(unCapacity, static_cast<size_t>(unAllocationGranularity));
+					unCapacity = __align_up(unCapacity, static_cast<size_t>(unPageSize));
 				}
 			}
 
-			m_unCapacity = unCapacity;
-			m_pPageAddress = nullptr;
-
+			m_unRegionCapacity = unCapacity;
 			if (pDesiredAddress) {
-				const size_t unBegin = reinterpret_cast<size_t>(pDesiredAddress) - 0x7FFFFFFF + 1;
-				const size_t unEnd = reinterpret_cast<size_t>(pDesiredAddress) + 0x7FFFFFFF - unCapacity;
-
-				MEMORY_BASIC_INFORMATION mbi;
-				memset(&mbi, 0, sizeof(mbi));
-
-				// [unAddress; unEnd] - From unAddress to unEnd (Forward)
-				for (size_t unAddress = reinterpret_cast<size_t>(pDesiredAddress); unAddress < unEnd; unAddress = __align_up(unAddress + static_cast<size_t>(unAllocationGranularity) - 1, static_cast<size_t>(unAllocationGranularity))) {
-					if (!VirtualQuery(reinterpret_cast<void*>(unAddress), &mbi, sizeof(mbi))) {
-						break;
+				auto vecBackwardRegions = __get_regions_info(reinterpret_cast<char*>(pDesiredAddress) - 0x7FFFFFFF + 1, 0x7FFFFFFF);
+				std::reverse(vecBackwardRegions.begin(), vecBackwardRegions.end());
+				for (auto& Region : vecBackwardRegions) { // [unAddress; unBegin] - From unAddress to unBegin (Backward)
+					if (!__is_relative(pDesiredAddress, Region.m_pBaseAddress)) {
+						continue;
 					}
 
-					if (mbi.State == MEM_FREE && mbi.RegionSize >= unCapacity) {
-						void* pPageAddress = VirtualAlloc(reinterpret_cast<void*>(unAddress), unCapacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-						if (pPageAddress) {
-							if (__is_relative(pDesiredAddress, pPageAddress)) {
-								m_pPageAddress = pPageAddress;
+					if (Region.m_unState == MEM_FREE) {
+						void* pRegionAddress = VirtualAlloc(reinterpret_cast<void*>(Region.m_pBaseAddress), Region.m_unSize, MEM_RESERVE, PAGE_READWRITE);
+						if (pRegionAddress) {
+							if (__is_relative(pDesiredAddress, pRegionAddress)) {
+								m_pRegionAddress = pRegionAddress;
+								break;
 							} else {
-								VirtualFree(pPageAddress, 0, MEM_RELEASE);
+								VirtualFree(pRegionAddress, 0, MEM_RELEASE);
 							}
-
-							break;
 						}
 					}
 				}
 
-				// [unAddress; unBegin] - From unAddress to unBegin (Backward)
-				if (!m_pPageAddress) {
-					for (size_t unAddress = reinterpret_cast<size_t>(pDesiredAddress); unAddress > unBegin; unAddress = __align_down(unAddress - 1, static_cast<size_t>(unAllocationGranularity))) {
-						if (!VirtualQuery(reinterpret_cast<void*>(unAddress), &mbi, sizeof(mbi))) {
-							break;
-						}
+				auto vecForwardRegions = __get_regions_info(pDesiredAddress, 0x7FFFFFFF);
+				for (auto& Region : vecForwardRegions) { // [unAddress; unEnd] - From unAddress to unEnd(Forward)
+					if (!__is_relative(pDesiredAddress, Region.m_pBaseAddress)) {
+						continue;
+					}
 
-						if (mbi.State == MEM_FREE && mbi.RegionSize >= unCapacity) {
-							void* pPageAddress = VirtualAlloc(reinterpret_cast<void*>(unAddress), unCapacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-							if (pPageAddress) {
-								if (__is_relative(pDesiredAddress, pPageAddress)) {
-									m_pPageAddress = pPageAddress;
-								} else {
-									VirtualFree(pPageAddress, 0, MEM_RELEASE);
-								}
-
+					if (Region.m_unState == MEM_FREE) {
+						void* pRegionAddress = VirtualAlloc(reinterpret_cast<void*>(Region.m_pBaseAddress), Region.m_unSize, MEM_RESERVE, PAGE_READWRITE);
+						if (pRegionAddress) {
+							if (__is_relative(pDesiredAddress, pRegionAddress)) {
+								m_pRegionAddress = pRegionAddress;
 								break;
+							} else {
+								VirtualFree(pRegionAddress, 0, MEM_RELEASE);
 							}
 						}
 					}
 				}
 			} else {
-				m_pPageAddress = VirtualAlloc(nullptr, unCapacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+				m_pRegionAddress = VirtualAlloc(nullptr, unCapacity, MEM_RESERVE, PAGE_READWRITE);
 			}
 
-			if (m_pPageAddress) {
-				m_FreeBlocks.emplace(m_pPageAddress, unCapacity);
+			if (!m_pRegionAddress) {
+				return;
+			}
+
+			REGION_INFO ri;
+			if (!__get_region_info(m_pRegionAddress, &ri)) {
+				return;
+			}
+
+			auto vecPages = __get_pages_info(m_pRegionAddress, unCapacity);
+			for (auto& PageInfo : vecPages) {
+				if (PageInfo.m_unState != MEM_RESERVE) {
+					continue;
+				}
+
+				m_Pages.emplace_back(PageInfo.m_pBaseAddress, true, true);
 			}
 		}
 
-		NearPage::~NearPage() {
-			if (m_pPageAddress) {
-				VirtualFree(m_pPageAddress, 0, MEM_RELEASE);
+		Region::~Region() {
+			if (m_pRegionAddress && m_unRegionCapacity) {
+				if (m_bAutoRestore) {
+					RestoreProtection();
+				}
+
+				if (!m_bIsManualRegion) {
+					VirtualFree(m_pRegionAddress, 0, MEM_RELEASE);
+				}
 			}
 		}
 
-		void* NearPage::Alloc(size_t unSize) {
-			if (!m_pPageAddress || !unSize) {
+		bool Region::GetProtection(const PDWORD pProtection) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity) {
+				return false;
+			}
+
+			REGION_INFO pi;
+			if (!__get_region_info(m_pRegionAddress, &pi)) {
+				return false;
+			}
+
+			if (pProtection) {
+				*pProtection = pi.m_unProtection;
+			}
+
+			return true;
+		}
+
+		bool Region::GetOriginalProtection(const PDWORD pProtection) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity) {
+				return false;
+			}
+
+			if (pProtection) {
+				*pProtection = m_unOriginalProtection;
+			}
+
+			return true;
+		}
+
+		bool Region::ChangeProtection(const DWORD unNewProtection) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity) {
+				return false;
+			}
+
+			DWORD unProtection = 0;
+			if (!VirtualProtect(const_cast<void*>(m_pRegionAddress), m_unRegionCapacity, unNewProtection, &unProtection)) {
+				return false;
+			}
+
+			if (unNewProtection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) {
+				if (!FlushInstructionCache(reinterpret_cast<HANDLE>(-1), m_pRegionAddress, m_unRegionCapacity)) {
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		bool Region::RestoreProtection() {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity) {
+				return false;
+			}
+
+			if (!ChangeProtection(m_unOriginalProtection)) {
+				return false;
+			}
+
+			return true;
+		}
+
+		bool Region::CloneFrom(Region* pSourceRegion) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity || !pSourceRegion) {
+				return false;
+			}
+
+			if (m_unRegionCapacity != pSourceRegion->GetRegionCapacity()) {
+				return false;
+			}
+
+			DWORD unProtection = 0;
+			if (!pSourceRegion->GetProtection(&unProtection)) {
+				return false;
+			}
+
+			if (!pSourceRegion->ChangeProtection(PAGE_READONLY)) {
+				return false;
+			}
+
+			if (!ChangeProtection(PAGE_READWRITE)) {
+				return false;
+			}
+
+			memcpy(m_pRegionAddress, pSourceRegion->GetRegionAddress(), pSourceRegion->GetRegionCapacity());
+
+			if (!ChangeProtection(unProtection)) {
+				return false;
+			}
+
+			if (!pSourceRegion->RestoreProtection()) {
+				return false;
+			}
+
+			return true;
+		}
+
+		bool Region::CloneTo(Region* pDestinationRegion) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity || !pDestinationRegion) {
+				return false;
+			}
+
+			if (m_unRegionCapacity != pDestinationRegion->GetRegionCapacity()) {
+				return false;
+			}
+
+			DWORD unProtection = 0;
+			if (!GetProtection(&unProtection)) {
+				return false;
+			}
+
+			if (!ChangeProtection(PAGE_READONLY)) {
+				return false;
+			}
+
+			if (!pDestinationRegion->ChangeProtection(PAGE_READWRITE)) {
+				return false;
+			}
+
+			memcpy(pDestinationRegion->GetRegionAddress(), m_pRegionAddress, m_unRegionCapacity);
+
+			if (!pDestinationRegion->ChangeProtection(unProtection)) {
+				return false;
+			}
+
+			if (!RestoreProtection()) {
+				return false;
+			}
+
+			return true;
+		}
+
+		bool Region::CloneFrom(void* pSourceBaseAddress, size_t unSize) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity || !pSourceBaseAddress) {
+				return false;
+			}
+
+			REGION_INFO pi;
+			if (!__get_region_info(pSourceBaseAddress, &pi)) {
+				return false;
+			}
+
+			if (pi.m_pBaseAddress != pSourceBaseAddress) {
+				return false;
+			}
+
+			if (unSize && (pi.m_unSize != unSize)) {
+				return false;
+			}
+
+			Region SourceRegion(pSourceBaseAddress, pi.m_unSize);
+			return SourceRegion.CloneTo(this);
+		}
+
+		bool Region::CloneTo(void* pDestinationBaseAddress, size_t unSize) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity || !pDestinationBaseAddress) {
+				return false;
+			}
+
+			REGION_INFO pi;
+			if (!__get_region_info(pDestinationBaseAddress, &pi)) {
+				return false;
+			}
+
+			if (pi.m_pBaseAddress != pDestinationBaseAddress) {
+				return false;
+			}
+
+			if (unSize && (pi.m_unSize != unSize)) {
+				return false;
+			}
+
+			Region DestinationRegion(pDestinationBaseAddress, pi.m_unSize);
+			return DestinationRegion.CloneFrom(this);
+		}
+
+		void* Region::Alloc(size_t unSize, size_t unSizeAlign, size_t unAddressAlign, Page** pUsedPage) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity || !unSize || !unSizeAlign || !unAddressAlign) {
 				return nullptr;
 			}
 
-			for (auto it = m_FreeBlocks.begin(); it != m_FreeBlocks.end(); ++it) {
-				if (it->m_unSize >= unSize) {
-					void* pAddress = it->m_pAddress;
+			const bool bSizeAlign = (unSizeAlign > 1) && !(unSizeAlign & (unSizeAlign - 1));
 
-					if (it->m_unSize > unSize) {
-						m_FreeBlocks.emplace(reinterpret_cast<char*>(it->m_pAddress) + unSize, it->m_unSize - unSize);
+			const size_t unSizeAlignSize = !bSizeAlign ? 0 : ((unSize % unSizeAlign) == 0) ? 0 : (unSizeAlign - (unSize % unSizeAlign));
+			const size_t unAlignedSize = unSize + unSizeAlignSize;
+
+			if (unAlignedSize > m_unRegionCapacity) {
+				return nullptr;
+			}
+
+			if (m_unUsedSpace + unAlignedSize > m_unRegionCapacity) {
+				return nullptr;
+			}
+
+			for (auto& Page : m_Pages) {
+				if ((Page.GetPageCapacity() - Page.GetDataSize()) >= unAlignedSize) {
+					void* pMemory = Page.Alloc(unSize, unSizeAlign, unAddressAlign);
+					if (!pMemory) {
+						continue;
 					}
 
-					m_ActiveBlocks.emplace(pAddress, unSize);
-					m_FreeBlocks.erase(it);
+					if (pUsedPage) {
+						*pUsedPage = &Page;
+					}
 
-					return pAddress;
+					m_unUsedSpace += unAlignedSize;
+					return pMemory;
 				}
 			}
 
 			return nullptr;
 		}
 
-		bool NearPage::DeAlloc(void* pAddress) {
-			if (!m_pPageAddress || !pAddress) {
+		void* Region::ZeroAlloc(size_t unSize, size_t unSizeAlign, size_t unAddressAlign, Page** pUsedPage) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity || !unSize || !unSizeAlign || !unAddressAlign) {
+				return nullptr;
+			}
+
+			void* pAddress = Alloc(unSize, unSizeAlign, unAddressAlign, pUsedPage);
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			memset(pAddress, 0, unSize);
+			return pAddress;
+		}
+
+		bool Region::DeAlloc(void* pAddress) {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity || !pAddress) {
 				return false;
 			}
 
-			auto it = m_ActiveBlocks.find(Block(pAddress, 0));
-			if (it != m_ActiveBlocks.end()) {
-				m_FreeBlocks.emplace(*it);
-				m_ActiveBlocks.erase(it);
-				MergeFreeBlocks();
-				return true;
+			for (auto it = m_Pages.begin(); it != m_Pages.end(); ++it) {
+				const size_t unDataSize = it->GetDataSize();
+				if (it->DeAlloc(pAddress)) {
+					m_unUsedSpace -= unDataSize;
+					return true;
+				}
 			}
 
 			return false;
 		}
 
-		void NearPage::DeAllocAll() {
-			if (!m_pPageAddress) {
+		void Region::DeAllocAll() {
+			if (m_Pages.empty() || !m_pRegionAddress || !m_unRegionCapacity) {
 				return;
 			}
 
-			m_FreeBlocks.clear();
-			m_ActiveBlocks.clear();
+			for (auto& Page : m_Pages) {
+				Page.DeAllocAll();
+			}
 
-			m_FreeBlocks.emplace(m_pPageAddress, m_unCapacity);
-
-			return;
+			m_unUsedSpace = 0;
 		}
 
-		void NearPage::MergeFreeBlocks() {
-			if (m_FreeBlocks.size() <= 1) {
-				return;
+		void* Region::GetRegionAddress() const {
+			return m_pRegionAddress;
+		}
+
+		size_t Region::GetRegionCapacity() const {
+			return m_unRegionCapacity;
+		}
+
+		size_t Region::GetDataSize() const {
+			size_t unDataSize = 0;
+
+			for (auto& Page : m_Pages) {
+				unDataSize += Page.GetDataSize();
 			}
 
-			std::set<Block> MergedFreeBlocks;
-			auto it = m_FreeBlocks.begin();
-			auto PrevBlock = *it;
-			++it;
+			return unDataSize;
+		}
 
-			while (it != m_FreeBlocks.end()) {
-				if ((reinterpret_cast<char*>(PrevBlock.m_pAddress) + PrevBlock.m_unSize) == it->m_pAddress) {
-					PrevBlock.m_unSize += it->m_unSize;
-				} else {
-					MergedFreeBlocks.insert(PrevBlock);
-					PrevBlock = *it;
+		bool Region::IsRegionEmpty() const {
+			if (m_Pages.empty()) {
+				return true;
+			}
+
+			for (auto& Page : m_Pages) {
+				if (Page.IsPageEmpty()) {
+					return false;
 				}
-
-				++it;
 			}
 
-			MergedFreeBlocks.insert(PrevBlock);
-			m_FreeBlocks = MergedFreeBlocks;
-		}
-
-		void* NearPage::GetAddress() const {
-			return m_pPageAddress;
-		}
-
-		size_t NearPage::GetCapacity() const {
-			return m_unCapacity;
-		}
-
-		size_t NearPage::GetSize() const {
-			size_t unSize = 0;
-
-			for (const auto& block : m_ActiveBlocks) {
-				unSize += block.m_unSize;
-			}
-
-			return unSize;
-		}
-
-		bool NearPage::IsEmpty() const {
-			return m_ActiveBlocks.empty();
+			return true;
 		}
 
 		// ----------------------------------------------------------------
 		// Storage
 		// ----------------------------------------------------------------
 
-		Storage::Storage(size_t unTotalCapacity, size_t unPageCapacity) {
-			if (!unPageSize || !unAllocationGranularity) {
+		Storage::Storage(size_t unTotalCapacity, size_t unRegionCapacity) {
+			if (!pMinimumApplicationAddress || !pMaximumApplicationAddress || !unPageSize || !unAllocationGranularity) {
 				SYSTEM_INFO sysinf;
 				GetSystemInfo(&sysinf);
+				pMinimumApplicationAddress = sysinf.lpMinimumApplicationAddress;
+				pMaximumApplicationAddress = sysinf.lpMaximumApplicationAddress;
 				unPageSize = sysinf.dwPageSize;
 				unAllocationGranularity = sysinf.dwAllocationGranularity;
 			}
@@ -5787,79 +7469,139 @@ namespace Detours {
 				if (unTotalCapacity < unPageSize) {
 					unTotalCapacity = unPageSize;
 				} else {
-					unTotalCapacity = __align_up(unTotalCapacity, static_cast<size_t>(unAllocationGranularity));
+					unTotalCapacity = __align_up(unTotalCapacity, static_cast<size_t>(unPageSize));
 				}
 			}
 
-			if (!unPageCapacity) {
-				unPageCapacity = unPageSize;
+			if (!unRegionCapacity) {
+				unRegionCapacity = unPageSize;
 			} else {
-				if (unPageCapacity < unPageSize) {
-					unPageCapacity = unPageSize;
+				if (unRegionCapacity < unPageSize) {
+					unRegionCapacity = unPageSize;
 				} else {
-					unPageCapacity = __align_up(unPageCapacity, static_cast<size_t>(unAllocationGranularity));
+					unRegionCapacity = __align_up(unRegionCapacity, static_cast<size_t>(unPageSize));
 				}
 			}
 
 			m_unTotalCapacity = unTotalCapacity;
-			m_unPageCapacity = unPageCapacity;
+			m_unRegionCapacity = unRegionCapacity;
 			m_unUsedSpace = 0;
 		}
 
-		void* Storage::Alloc(size_t unSize) {
-			if (unSize > m_unPageCapacity) {
+		void* Storage::Alloc(size_t unSize, size_t unSizeAlign, size_t unAddressAlign, void* pDesiredAddress, Page** pUsedPage, Region** pUsedRegion) {
+			if (!unSize || !unSizeAlign || !unAddressAlign) {
 				return nullptr;
 			}
 
-			if (m_unUsedSpace + unSize > m_unTotalCapacity) {
+			const bool bSizeAlign = (unSizeAlign > 1) && !(unSizeAlign & (unSizeAlign - 1));
+
+			const size_t unSizeAlignSize = !bSizeAlign ? 0 : ((unSize % unSizeAlign) == 0) ? 0 : (unSizeAlign - (unSize % unSizeAlign));
+			const size_t unAlignedSize = unSize + unSizeAlignSize;
+
+			if (unAlignedSize > m_unRegionCapacity) {
 				return nullptr;
 			}
 
-			if (m_Pages.empty()) {
-				m_Pages.emplace_back(m_unPageCapacity);
-				if (!m_Pages.back().GetAddress()) {
-					m_Pages.pop_back();
+			if (m_unUsedSpace + unAlignedSize > m_unTotalCapacity) {
+				return nullptr;
+			}
+
+			if (m_Regions.empty()) {
+				m_Regions.emplace_back(pDesiredAddress, m_unRegionCapacity);
+				if (!m_Regions.back().GetRegionAddress()) {
+					m_Regions.pop_back();
+					return nullptr;
 				}
 			}
 
-			for (auto& Page : m_Pages) {
-				if ((Page.GetCapacity() - Page.GetSize()) >= unSize) {
-					void* pMemory = Page.Alloc(unSize);
-					if (!pMemory) {
-						continue;
+			if (!m_Regions.back().GetRegionAddress()) {
+				m_Regions.pop_back();
+				return nullptr;
+			}
+
+			if (pDesiredAddress) {
+				for (auto& Region : m_Regions) {
+					if ((Region.GetRegionCapacity() - Region.GetDataSize()) >= unAlignedSize) {
+						if (!__is_relative(pDesiredAddress, Region.GetRegionAddress()) || !__is_relative(pDesiredAddress, reinterpret_cast<char*>(Region.GetRegionAddress()) + Region.GetDataSize())) {
+							continue;
+						}
+
+						void* pMemory = Region.Alloc(unSize, unSizeAlign, unAddressAlign, pUsedPage);
+						if (!pMemory) {
+							continue;
+						}
+
+						if (pUsedRegion) {
+							*pUsedRegion = &Region;
+						}
+
+						m_unUsedSpace += unAlignedSize;
+						return pMemory;
+					}
+				}
+			} else {
+				for (auto& Region : m_Regions) {
+					if ((Region.GetRegionCapacity() - Region.GetDataSize()) >= unAlignedSize) {
+						void* pMemory = Region.Alloc(unSize, unSizeAlign, unAddressAlign, pUsedPage);
+						if (!pMemory) {
+							continue;
+						}
+
+						if (pUsedRegion) {
+							*pUsedRegion = &Region;
+						}
+
+						m_unUsedSpace += unAlignedSize;
+						return pMemory;
+					}
+				}
+			}
+
+			if (m_unUsedSpace + m_unRegionCapacity <= m_unTotalCapacity) {
+				m_Regions.emplace_back(pDesiredAddress, m_unRegionCapacity);
+
+				void* pMemory = m_Regions.back().Alloc(unSize, unSizeAlign, unAddressAlign);
+				if (pMemory) {
+					if (pUsedRegion) {
+						*pUsedRegion = &m_Regions.back();
 					}
 
-					m_unUsedSpace += unSize;
-					return pMemory;
-				}
-			}
-
-			if (m_unUsedSpace + m_unPageCapacity <= m_unTotalCapacity) {
-				m_Pages.emplace_back(m_unPageCapacity);
-
-				void* pMemory = m_Pages.back().Alloc(unSize);
-				if (pMemory) {
-					m_unUsedSpace += unSize;
+					m_unUsedSpace += unAlignedSize;
 					return pMemory;
 				}
 
-				m_Pages.pop_back();
+				m_Regions.pop_back();
 			}
 
 			return nullptr;
 		}
 
+		void* Storage::ZeroAlloc(size_t unSize, size_t unSizeAlign, size_t unAddressAlign, void* pDesiredAddress, Page** pUsedPage, Region** pUsedRegion) {
+			if (!unSize || !unSizeAlign || !unAddressAlign) {
+				return nullptr;
+			}
+
+			void* pAddress = Alloc(unSize, unSizeAlign, unAddressAlign, pDesiredAddress, pUsedPage, pUsedRegion);
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			memset(pAddress, 0, unSize);
+			return pAddress;
+		}
+
 		bool Storage::DeAlloc(void* pAddress) {
-			if (m_Pages.empty()) {
+			if (m_Regions.empty()) {
 				return false;
 			}
 
-			for (auto it = m_Pages.begin(); it != m_Pages.end(); ++it) {
+			for (auto it = m_Regions.begin(); it != m_Regions.end(); ++it) {
+				const size_t unDataSize = it->GetDataSize();
 				if (it->DeAlloc(pAddress)) {
-					m_unUsedSpace -= it->GetSize();
+					m_unUsedSpace -= unDataSize;
 
-					if (it->IsEmpty()) {
-						m_Pages.erase(it);
+					if (it->IsRegionEmpty()) {
+						m_Regions.erase(it);
 					}
 
 					return true;
@@ -5870,200 +7612,34 @@ namespace Detours {
 		}
 
 		bool Storage::DeAllocAll() {
-			if (m_Pages.empty()) {
+			if (m_Regions.empty()) {
 				return false;
 			}
 
-			for (auto& Page : m_Pages) {
-				Page.DeAllocAll();
+			for (auto& Region : m_Regions) {
+				Region.DeAllocAll();
 			}
 
-			m_Pages.clear();
+			m_Regions.clear();
 			m_unUsedSpace = 0;
-
 			return true;
 		}
 
-		size_t Storage::GetCapacity() const {
+		size_t Storage::GetStorageCapacity() const {
 			return m_unTotalCapacity;
 		}
 
-		size_t Storage::GetSize() const {
+		size_t Storage::GetDataSize() const {
 			return m_unUsedSpace;
 		}
 
-		bool Storage::IsEmpty() const {
-			if (m_Pages.empty()) {
+		bool Storage::IsStorageEmpty() const {
+			if (m_Regions.empty()) {
 				return true;
 			}
 
-			for (auto it = m_Pages.begin(); it != m_Pages.end(); ++it) {
-				if (!it->IsEmpty()) {
-					return false;
-				}
-			}
-
-			return true;
-		}
-
-		// ----------------------------------------------------------------
-		// NearStorage
-		// ----------------------------------------------------------------
-
-		NearStorage::NearStorage(size_t unTotalCapacity, size_t unPageCapacity) {
-			if (!unPageSize || !unAllocationGranularity) {
-				SYSTEM_INFO sysinf;
-				GetSystemInfo(&sysinf);
-				unPageSize = sysinf.dwPageSize;
-				unAllocationGranularity = sysinf.dwAllocationGranularity;
-			}
-
-			if (!unTotalCapacity) {
-				unTotalCapacity = unPageSize;
-			} else {
-				if (unTotalCapacity < unPageSize) {
-					unTotalCapacity = unPageSize;
-				} else {
-					unTotalCapacity = __align_up(unTotalCapacity, static_cast<size_t>(unAllocationGranularity));
-				}
-			}
-
-			if (!unPageCapacity) {
-				unPageCapacity = unPageSize;
-			} else {
-				if (unPageCapacity < unPageSize) {
-					unPageCapacity = unPageSize;
-				} else {
-					unPageCapacity = __align_up(unPageCapacity, static_cast<size_t>(unAllocationGranularity));
-				}
-			}
-
-			m_unTotalCapacity = unTotalCapacity;
-			m_unPageCapacity = unPageCapacity;
-			m_unUsedSpace = 0;
-		}
-
-		void* NearStorage::Alloc(size_t unSize, void* pDesiredAddress) {
-			if (unSize > m_unPageCapacity) {
-				return nullptr;
-			}
-
-			if (m_unUsedSpace + unSize > m_unTotalCapacity) {
-				return nullptr;
-			}
-
-			if (m_Pages.empty()) {
-				m_Pages.emplace_back(m_unPageCapacity, pDesiredAddress);
-				if (!m_Pages.back().GetAddress()) {
-					m_Pages.pop_back();
-				}
-			}
-
-			if (pDesiredAddress) {
-				for (auto& Page : m_Pages) {
-					if ((Page.GetCapacity() - Page.GetSize()) >= unSize) {
-						if (!__is_relative(pDesiredAddress, reinterpret_cast<char*>(Page.GetAddress()) + Page.GetSize())) {
-							continue;
-						}
-
-						void* pMemory = Page.Alloc(unSize);
-						if (!pMemory) {
-							continue;
-						}
-
-						m_unUsedSpace += unSize;
-						return pMemory;
-					}
-				}
-
-				m_Pages.emplace_back(m_unPageCapacity, pDesiredAddress);
-
-				void* pMemory = m_Pages.back().Alloc(unSize);
-				if (pMemory) {
-					m_unUsedSpace += unSize;
-					return pMemory;
-				}
-
-				m_Pages.pop_back();
-			} else {
-				for (auto& Page : m_Pages) {
-					if ((Page.GetCapacity() - Page.GetSize()) >= unSize) {
-						void* pMemory = Page.Alloc(unSize);
-						if (!pMemory) {
-							continue;
-						}
-
-						m_unUsedSpace += unSize;
-						return pMemory;
-					}
-				}
-			}
-
-			if (m_unUsedSpace + m_unPageCapacity <= m_unTotalCapacity) {
-				m_Pages.emplace_back(m_unPageCapacity, pDesiredAddress);
-
-				void* pMemory = m_Pages.back().Alloc(unSize);
-				if (pMemory) {
-					m_unUsedSpace += unSize;
-					return pMemory;
-				}
-
-				m_Pages.pop_back();
-			}
-
-			return nullptr;
-		}
-
-		bool NearStorage::DeAlloc(void* pAddress) {
-			if (m_Pages.empty()) {
-				return false;
-			}
-
-			for (auto it = m_Pages.begin(); it != m_Pages.end(); ++it) {
-				if (it->DeAlloc(pAddress)) {
-					m_unUsedSpace -= it->GetSize();
-
-					if (it->IsEmpty()) {
-						m_Pages.erase(it);
-					}
-
-					return true;
-				}
-			}
-
-			return false;
-		}
-
-		bool NearStorage::DeAllocAll() {
-			if (m_Pages.empty()) {
-				return false;
-			}
-
-			for (auto& Page : m_Pages) {
-				Page.DeAllocAll();
-			}
-
-			m_Pages.clear();
-			m_unUsedSpace = 0;
-
-			return true;
-		}
-
-		size_t NearStorage::GetCapacity() const {
-			return m_unTotalCapacity;
-		}
-
-		size_t NearStorage::GetSize() const {
-			return m_unUsedSpace;
-		}
-
-		bool NearStorage::IsEmpty() const {
-			if (m_Pages.empty()) {
-				return true;
-			}
-
-			for (auto it = m_Pages.begin(); it != m_Pages.end(); ++it) {
-				if (!it->IsEmpty()) {
+			for (auto& Region : m_Regions) {
+				if (!Region.IsRegionEmpty()) {
 					return false;
 				}
 			}
@@ -6075,100 +7651,232 @@ namespace Detours {
 		// Protection
 		// ----------------------------------------------------------------
 
-		Protection::Protection(void const* const pAddress, const size_t unSize, const bool bAutoRestore) : m_pAddress(pAddress), m_unSize(unSize), m_bAutoRestore(bAutoRestore) {
-			m_unOriginalProtection = 0;
+		Protection::Protection(void* pAddress, size_t unSize, bool bAutoRestore) {
+			m_bAutoRestore = bAutoRestore;
+			m_bUseRegions = false;
 
 			if (!pAddress || !unSize) {
 				return;
 			}
 
-			MEMORY_BASIC_INFORMATION mbi;
-			memset(&mbi, 0, sizeof(mbi));
+			auto vecRegions = __get_regions_info(pAddress, unSize);
+			if (!vecRegions.empty() && (vecRegions.size() > 1)) {
+				m_bUseRegions = true;
+				for (auto& Region : vecRegions) {
+					m_Regions.emplace_back(Region.m_pBaseAddress, false);
+				}
 
-			if (!VirtualQuery(m_pAddress, &mbi, sizeof(mbi))) {
 				return;
 			}
 
-			m_unOriginalProtection = mbi.Protect;
+			const size_t unLargePageMinimumSize = GetLargePageMinimum();
+			for (auto& Region : vecRegions) {
+				if (Region.m_unSize >= unLargePageMinimumSize) {
+					m_bUseRegions = true;
+					break;
+				}
+			}
+
+			if (m_bUseRegions) {
+				for (auto& Region : vecRegions) {
+					m_Regions.emplace_back(Region.m_pBaseAddress, false);
+				}
+
+				return;
+			}
+
+			auto vecPages = __get_pages_info(pAddress, unSize);
+			if (vecPages.empty()) {
+				return;
+			}
+
+			for (auto& PageInfo : vecPages) {
+				m_Pages.emplace_back(PageInfo.m_pBaseAddress, false);
+			}
 		}
 
 		Protection::~Protection() {
-			if (!m_pAddress || !m_unSize || !m_bAutoRestore) {
-				return;
+			if (m_bAutoRestore) {
+				Restore();
 			}
-
-			DWORD unProtection = 0;
-			VirtualProtect(const_cast<void*>(m_pAddress), m_unSize, m_unOriginalProtection, &unProtection);
 		}
 
-		bool Protection::GetProtection(const PDWORD pProtection) {
-			if (!m_pAddress || !m_unSize) {
+		bool Protection::Change(const DWORD unNewProtection) {
+			if (!m_bUseRegions && m_Pages.empty()) {
 				return false;
 			}
 
-			MEMORY_BASIC_INFORMATION mbi;
-			memset(&mbi, 0, sizeof(mbi));
-
-			if (!VirtualQuery(m_pAddress, &mbi, sizeof(mbi))) {
+			if (m_bUseRegions && m_Regions.empty()) {
 				return false;
 			}
 
-			if (pProtection) {
-				*pProtection = mbi.Protect;
-			}
-
-			return true;
-		}
-
-		bool Protection::ChangeProtection(const DWORD unNewProtection) {
-			if (!m_pAddress || !m_unSize) {
-				return false;
-			}
-
-			if (unNewProtection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) {
-				MEMORY_BASIC_INFORMATION mbi;
-				memset(&mbi, 0, sizeof(mbi));
-
-				if (!VirtualQuery(m_pAddress, &mbi, sizeof(mbi))) {
-					return false;
+			if (!m_bUseRegions) {
+				for (auto& Page : m_Pages) {
+					if (!Page.ChangeProtection(unNewProtection)) {
+						Restore();
+						return false;
+					}
 				}
-
-				if (!FlushInstructionCache(reinterpret_cast<HANDLE>(-1), mbi.BaseAddress, mbi.RegionSize)) {
-					return false;
+			} else {
+				for (auto& Region : m_Regions) {
+					if (!Region.ChangeProtection(unNewProtection)) {
+						Restore();
+						return false;
+					}
 				}
 			}
 
-			DWORD unProtection = 0;
-			if (!VirtualProtect(const_cast<void*>(m_pAddress), m_unSize, unNewProtection, &unProtection)) {
+			return true;
+		}
+
+		bool Protection::Restore() {
+			if (!m_bUseRegions && m_Pages.empty()) {
 				return false;
+			}
+
+			if (m_bUseRegions && m_Regions.empty()) {
+				return false;
+			}
+
+			if (!m_bUseRegions) {
+				for (auto& Page : m_Pages) {
+					if (!Page.RestoreProtection()) {
+						return false;
+					}
+				}
+			} else {
+				for (auto& Region : m_Regions) {
+					if (!Region.RestoreProtection()) {
+						return false;
+					}
+				}
 			}
 
 			return true;
 		}
 
-		bool Protection::RestoreProtection() {
-			if (!m_pAddress || !m_unSize) {
+		// ----------------------------------------------------------------
+		// MemoryManager
+		// ----------------------------------------------------------------
+
+		Page* MemoryManager::CreatePage() {
+			auto pPage = std::make_unique<Page>();
+			if (!pPage) {
+				return nullptr;
+			}
+
+			Page* pPageAddress = pPage.get();
+			m_Pages.emplace_back(std::move(pPage));
+			return pPageAddress;
+		}
+
+		Storage* MemoryManager::CreateStorage(size_t unTotalCapacity, size_t unPageCapacity) {
+			auto pStorage = std::make_unique<Storage>(unTotalCapacity, unPageCapacity);
+			if (!pStorage) {
+				return nullptr;
+			}
+
+			Storage* pStorageAddress = pStorage.get();
+			m_Storages.emplace_back(std::move(pStorage));
+			return pStorageAddress;
+		}
+
+		bool MemoryManager::DestroyPage(Page* pPage) {
+			if (!pPage) {
 				return false;
 			}
 
-			DWORD unProtection = 0;
-			if (!VirtualProtect(const_cast<void*>(m_pAddress), m_unSize, m_unOriginalProtection, &unProtection)) {
+			for (auto it = m_Pages.begin(); it != m_Pages.end(); ++it) {
+				if (it->get() == pPage) {
+					m_Pages.erase(it);
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		bool MemoryManager::DestroyStorage(Storage* pStorage) {
+			if (!pStorage) {
 				return false;
 			}
 
-			return true;
+			for (auto it = m_Storages.begin(); it != m_Storages.end(); ++it) {
+				if (it->get() == pStorage) {
+					m_Storages.erase(it);
+					return true;
+				}
+			}
+
+			return false;
 		}
 
-		void const* Protection::GetAddress() const {
-			return m_pAddress;
+		std::unique_ptr<Page> MemoryManager::GetPage(void* pAddress) {
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			PAGE_INFO pi;
+			if (!__get_page_info(pAddress, &pi)) {
+				return nullptr;
+			}
+
+			return std::make_unique<Page>(pi.m_pBaseAddress, false);
 		}
 
-		size_t Protection::GetSize() const {
-			return m_unSize;
+		std::unique_ptr<Region> MemoryManager::GetRegion(void* pAddress) {
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			REGION_INFO ri;
+			if (!__get_region_info(pAddress, &ri)) {
+				return nullptr;
+			}
+
+			return std::make_unique<Region>(ri.m_pBaseAddress, false);
 		}
 
-		DWORD Protection::GetOriginalProtection() const {
-			return m_unOriginalProtection;
+		std::vector<Page> MemoryManager::CollectPages(void* pAddress, size_t unSize) {
+			std::vector<Page> vecPages;
+
+			if (!pAddress || !unSize) {
+				return vecPages;
+			}
+
+			auto vecPagesInfo = __get_pages_info(pAddress, unSize);
+			if (vecPagesInfo.empty()) {
+				return vecPages;
+			}
+
+			vecPages.reserve(vecPagesInfo.size());
+
+			for (auto& PageInfo : vecPagesInfo) {
+				vecPages.emplace_back(PageInfo.m_pBaseAddress, true);
+			}
+
+			return vecPages;
+		}
+
+		std::vector<Region> MemoryManager::CollectRegions(void* pAddress, size_t unSize) {
+			std::vector<Region> vecRegions;
+
+			if (!pAddress || !unSize) {
+				return vecRegions;
+			}
+
+			auto vecRegionsInfo = __get_regions_info(pAddress, unSize);
+			if (vecRegionsInfo.empty()) {
+				return vecRegions;
+			}
+
+			vecRegions.reserve(vecRegionsInfo.size());
+
+			for (auto& RegionInfo : vecRegionsInfo) {
+				vecRegions.emplace_back(RegionInfo.m_pBaseAddress, true);
+			}
+
+			return vecRegions;
 		}
 	}
 
@@ -6217,37 +7925,491 @@ namespace Detours {
 		}
 
 		// ----------------------------------------------------------------
-		// MemoryHookCallBack
+		// HardwareHookCallBack
 		// ----------------------------------------------------------------
 
-		static bool MemoryHookCallBack(const EXCEPTION_RECORD& Exception, const PCONTEXT pCTX) {
-			if (Exception.ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+		struct REGISTER_DR6 {
+			unsigned int m_unB0 : 1;  // Bit 0: Breakpoint 0 condition detected
+			unsigned int m_unB1 : 1;  // Bit 1: Breakpoint 1 condition detected
+			unsigned int m_unB2 : 1;  // Bit 2: Breakpoint 2 condition detected
+			unsigned int m_unB3 : 1;  // Bit 3: Breakpoint 3 condition detected
+			unsigned int : 8;         // Bit 4-11: Reserved
+			unsigned int m_unBD : 1;  // Bit 12: Debug register access detected
+			unsigned int m_unBS : 1;  // Bit 13: Single step
+			unsigned int m_unBT : 1;  // Bit 14: Task switch
+			unsigned int m_unRTM : 1; // Bit 15: Restricted Transactional Memory
+			unsigned int : 16;        // Bit 16-31: Reserved
+#ifdef _M_X64
+			unsigned int : 32;        // Bit 32-63: Reserved (x64 upper bits)
+#endif
+		};
+
+		struct REGISTER_DR7 {
+			unsigned int m_unL0 : 1;   // Bit 0: Local breakpoint 0 enable
+			unsigned int m_unG0 : 1;   // Bit 1: Global breakpoint 0 enable
+			unsigned int m_unL1 : 1;   // Bit 2: Local breakpoint 1 enable
+			unsigned int m_unG1 : 1;   // Bit 3: Global breakpoint 1 enable
+			unsigned int m_unL2 : 1;   // Bit 4: Local breakpoint 2 enable
+			unsigned int m_unG2 : 1;   // Bit 5: Global breakpoint 2 enable
+			unsigned int m_unL3 : 1;   // Bit 6: Local breakpoint 3 enable
+			unsigned int m_unG3 : 1;   // Bit 7: Global breakpoint 3 enable
+			unsigned int m_unLE : 1;   // Bit 8: Local exact breakpoint enable
+			unsigned int m_unGE : 1;   // Bit 9: Global exact breakpoint enable
+			unsigned int : 3;          // Bit 10-12: Reserved
+			unsigned int m_unGD : 1;   // Bit 13: General detect enable
+			unsigned int : 2;          // Bit 14-15: Reserved
+			unsigned int m_unRW0 : 2;  // Bit 16-17: Breakpoint 0 condition
+			unsigned int m_unLEN0 : 2; // Bit 18-19: Breakpoint 0 length
+			unsigned int m_unRW1 : 2;  // Bit 20-21: Breakpoint 1 condition
+			unsigned int m_unLEN1 : 2; // Bit 22-23: Breakpoint 1 length
+			unsigned int m_unRW2 : 2;  // Bit 24-25: Breakpoint 2 condition
+			unsigned int m_unLEN2 : 2; // Bit 26-27: Breakpoint 2 length
+			unsigned int m_unRW3 : 2;  // Bit 28-29: Breakpoint 3 condition
+			unsigned int m_unLEN3 : 2; // Bit 30-31: Breakpoint 3 length
+#ifdef _M_X64
+			unsigned int : 32;         // Bit 32-63: Reserved
+#endif
+		};
+
+		struct REGISTER_FLAGS {
+			unsigned int m_unCF : 1;   // Bit 0: Carry Flag
+			unsigned int : 1;          // Bit 1: Reserved (always 1 on older CPUs)
+			unsigned int m_unPF : 1;   // Bit 2: Parity Flag
+			unsigned int : 1;          // Bit 3: Reserved
+			unsigned int m_unAF : 1;   // Bit 4: Auxiliary Carry Flag
+			unsigned int : 1;          // Bit 5: Reserved
+			unsigned int m_unZF : 1;   // Bit 6: Zero Flag
+			unsigned int m_unSF : 1;   // Bit 7: Sign Flag
+			unsigned int m_unTF : 1;   // Bit 8: Trap Flag
+			unsigned int m_unIF : 1;   // Bit 9: Interrupt Enable Flag
+			unsigned int m_unDF : 1;   // Bit 10: Direction Flag
+			unsigned int m_unOF : 1;   // Bit 11: Overflow Flag
+			unsigned int m_unIOPL : 2; // Bit 12-13: I/O Privilege Level
+			unsigned int m_unNT : 1;   // Bit 14: Nested Task
+			unsigned int : 1;          // Bit 15: Reserved
+			unsigned int m_unRF : 1;   // Bit 16: Resume Flag
+			unsigned int m_unVM : 1;   // Bit 17: Virtual 8086 Mode Flag
+			unsigned int m_unAC : 1;   // Bit 18: Alignment Check
+			unsigned int m_unVIF : 1;  // Bit 19: Virtual Interrupt Flag
+			unsigned int m_unVIP : 1;  // Bit 20: Virtual Interrupt Pending
+			unsigned int m_unID : 1;   // Bit 21: ID Flag
+			unsigned int : 10;         // Bit 22-31: Reserved
+#ifdef _M_X64
+			unsigned int : 32;         // Bit 32-63: Reserved
+#endif
+		};
+
+		static bool HardwareHookCallBack(const EXCEPTION_RECORD& Exception, PCONTEXT pCTX) {
+			if (Exception.ExceptionCode != EXCEPTION_SINGLE_STEP) {
 				return false;
 			}
 
-			for (auto it = g_MemoryHooks.begin(); it != g_MemoryHooks.end(); ++it) {
-				const auto& pHook = it->second;
-				if (!pHook) {
+			const DWORD unCurrentTID = GetCurrentThreadId();
+			auto& dr6 = *reinterpret_cast<REGISTER_DR6*>(&pCTX->Dr6);
+			auto& dr7 = *reinterpret_cast<REGISTER_DR7*>(&pCTX->Dr7);
+			auto& eflags = *reinterpret_cast<REGISTER_FLAGS*>(&pCTX->EFlags);
+
+			bool bRestored = false;
+
+			AcquireSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+			for (auto it = g_HardwareHookRecords.begin(); it != g_HardwareHookRecords.end(); ) {
+				auto& pRecord = *it;
+				if (!pRecord || (pRecord->m_unThreadID != unCurrentTID) || !pRecord->m_bPendingRestore.load(std::memory_order_acquire)) {
+					++it;
 					continue;
 				}
 
-				if (pHook->GetAddress() != Exception.ExceptionAddress) {
+				if (pRecord->m_bCancelRestore.load(std::memory_order_acquire)) {
+					pRecord->m_bPendingRestore.store(false, std::memory_order_release);
+					pRecord->m_bCancelRestore.store(false, std::memory_order_release);
+					eflags.m_unTF = 0;
+					dr6.m_unBS = 0;
+					it = g_HardwareHookRecords.erase(it);
+					bRestored = true;
 					continue;
 				}
 
-				if (pHook->IsAutoDisable()) {
-					pHook->Disable();
+				unsigned char unTypeValue = 0;
+				switch (pRecord->m_unType) {
+					case HARDWARE_HOOK_TYPE::TYPE_EXECUTE:
+						unTypeValue = 0;
+						break;
+
+					case HARDWARE_HOOK_TYPE::TYPE_WRITE:
+						unTypeValue = 1;
+						break;
+
+					case HARDWARE_HOOK_TYPE::TYPE_ACCESS:
+						unTypeValue = 3;
+						break;
 				}
 
-				const auto& pCallBack = pHook->GetCallBack();
-				if (!pCallBack) {
+				unsigned char unSizeValue = 0;
+				switch (pRecord->m_unSize) {
+					case 1:
+						unSizeValue = 0;
+						break;
+
+					case 2:
+						unSizeValue = 1;
+						break;
+
+					case 4:
+						unSizeValue = 3;
+						break;
+
+#ifdef _M_X64
+					case 8:
+						unSizeValue = 2;
+						break;
+#endif
+				}
+
+				switch (pRecord->m_unRegister) {
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR0:
+#ifdef _M_X64
+						pCTX->Dr0 = reinterpret_cast<DWORD64>(pRecord->m_pAddress);
+#else
+							pCTX->Dr0 = reinterpret_cast<DWORD>(pRecord->m_pAddress);
+#endif
+							dr7.m_unL0 = 1;
+							dr7.m_unRW0 = unTypeValue;
+							dr7.m_unLEN0 = unSizeValue;
+							break;
+
+						case HARDWARE_HOOK_REGISTER::REGISTER_DR1:
+#ifdef _M_X64
+							pCTX->Dr1 = reinterpret_cast<DWORD64>(pRecord->m_pAddress);
+#else
+							pCTX->Dr1 = reinterpret_cast<DWORD>(pRecord->m_pAddress);
+#endif
+							dr7.m_unL1 = 1;
+							dr7.m_unRW1 = unTypeValue;
+							dr7.m_unLEN1 = unSizeValue;
+							break;
+
+						case HARDWARE_HOOK_REGISTER::REGISTER_DR2:
+#ifdef _M_X64
+							pCTX->Dr2 = reinterpret_cast<DWORD64>(pRecord->m_pAddress);
+#else
+							pCTX->Dr2 = reinterpret_cast<DWORD>(pRecord->m_pAddress);
+#endif
+							dr7.m_unL2 = 1;
+							dr7.m_unRW2 = unTypeValue;
+							dr7.m_unLEN2 = unSizeValue;
+							break;
+
+						case HARDWARE_HOOK_REGISTER::REGISTER_DR3:
+#ifdef _M_X64
+							pCTX->Dr3 = reinterpret_cast<DWORD64>(pRecord->m_pAddress);
+#else
+							pCTX->Dr3 = reinterpret_cast<DWORD>(pRecord->m_pAddress);
+#endif
+							dr7.m_unL3 = 1;
+							dr7.m_unRW3 = unTypeValue;
+							dr7.m_unLEN3 = unSizeValue;
+							break;
+				}
+
+				dr7.m_unLE = 0;
+				dr7.m_unGE = 0;
+				dr7.m_unGD = 0;
+
+				pRecord->m_bPendingRestore.store(false, std::memory_order_release);
+				bRestored = true;
+
+				if (pRecord->m_bPendingDeletion.load(std::memory_order_acquire)) {
+					it = g_HardwareHookRecords.erase(it);
+				} else {
+					++it;
+				}
+			}
+
+			ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+			if (bRestored) {
+				dr6.m_unBS = 0;
+				eflags.m_unTF = 0;
+			}
+
+			HARDWARE_HOOK_REGISTER unRegister = HARDWARE_HOOK_REGISTER::REGISTER_DR0;
+
+			if (dr6.m_unB0) {
+				unRegister = HARDWARE_HOOK_REGISTER::REGISTER_DR0;
+			} else if (dr6.m_unB1) {
+				unRegister = HARDWARE_HOOK_REGISTER::REGISTER_DR1;
+			} else if (dr6.m_unB2) {
+				unRegister = HARDWARE_HOOK_REGISTER::REGISTER_DR2;
+			} else if (dr6.m_unB3) {
+				unRegister = HARDWARE_HOOK_REGISTER::REGISTER_DR3;
+			} else {
+				return bRestored;
+			}
+
+			fnHardwareHookCallBack pCallBack = nullptr;
+
+			AcquireSRWLockShared(&g_HardwareHookRecordsLock);
+
+			for (auto& pRecord : g_HardwareHookRecords) {
+				if (!pRecord || pRecord->m_bPendingDeletion.load(std::memory_order_acquire) || (pRecord->m_unThreadID != unCurrentTID) || (pRecord->m_unRegister != unRegister)) {
+					continue;
+				}
+
+				bool bEnabled = false;
+
+				switch (unRegister) {
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR0:
+						bEnabled = (dr7.m_unL0 || dr7.m_unG0);
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR1:
+						bEnabled = (dr7.m_unL1 || dr7.m_unG1);
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR2:
+						bEnabled = (dr7.m_unL2 || dr7.m_unG2);
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR3:
+						bEnabled = (dr7.m_unL3 || dr7.m_unG3);
+						break;
+				}
+
+				if (!bEnabled) {
+					continue;
+				}
+
+				pRecord->m_bPendingRestore.store(true, std::memory_order_release);
+
+				switch (unRegister) {
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR0:
+						dr6.m_unB0 = 0;
+						dr7.m_unL0 = 0;
+						dr7.m_unG0 = 0;
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR1:
+						dr6.m_unB1 = 0;
+						dr7.m_unL1 = 0;
+						dr7.m_unG1 = 0;
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR2:
+						dr6.m_unB2 = 0;
+						dr7.m_unL2 = 0;
+						dr7.m_unG2 = 0;
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR3:
+						dr6.m_unB3 = 0;
+						dr7.m_unL3 = 0;
+						dr7.m_unG3 = 0;
+						break;
+				}
+
+				eflags.m_unTF = 1;
+				pCallBack = pRecord->m_pCallBack;
+				break;
+			}
+
+			ReleaseSRWLockShared(&g_HardwareHookRecordsLock);
+
+			if (pCallBack) {
+				pCallBack(pCTX);
+				return true;
+			}
+
+			return bRestored;
+		}
+
+		// ----------------------------------------------------------------
+		// MemoryHookCallBack
+		// ----------------------------------------------------------------
+
+		static bool MemoryHookCallBack(const EXCEPTION_RECORD& Exception, PCONTEXT pCTX) {
+			if (!pCTX) {
+				return false;
+			}
+
+			auto& eflags = *reinterpret_cast<REGISTER_FLAGS*>(&pCTX->EFlags);
+			const DWORD unCurrentTID = GetCurrentThreadId();
+
+			if (Exception.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+				eflags.m_unTF = 0;
+
+				PMEMORY_HOOK_RECORD pRecord = nullptr;
+				MEMORY_HOOK_POST_CONTEXT PostCTX = {};
+
+				AcquireSRWLockExclusive(&g_MemoryHookStacksLock);
+				{
+					auto it = g_MemoryHookOpenedStacks.find(unCurrentTID);
+					if (it != g_MemoryHookOpenedStacks.end() && !it->second.empty()) {
+						pRecord = it->second.back();
+						it->second.pop_back();
+						if (it->second.empty()) {
+							g_MemoryHookOpenedStacks.erase(it);
+						}
+					}
+
+					auto jt = g_MemoryHookPostStacks.find(unCurrentTID);
+					if (jt != g_MemoryHookPostStacks.end() && !jt->second.empty()) {
+						auto& vecStacks = jt->second;
+
+						if (!vecStacks.empty() && vecStacks.back().m_pRecord == pRecord) {
+							PostCTX = vecStacks.back();
+							vecStacks.pop_back();
+						} else {
+							for (size_t k = vecStacks.size(); k > 0; --k) {
+								if (vecStacks[k - 1].m_pRecord == pRecord) {
+									PostCTX = vecStacks[k - 1];
+									vecStacks.erase(vecStacks.begin() + (k - 1));
+									break;
+								}
+							}
+						}
+
+						if (vecStacks.empty()) {
+							g_MemoryHookPostStacks.erase(jt);
+						}
+					}
+				}
+				ReleaseSRWLockExclusive(&g_MemoryHookStacksLock);
+
+				if (!pRecord) {
 					return false;
 				}
 
-				return pCallBack(pHook, pCTX);
+				if (pRecord->m_pPostCallBack) {
+					if (PostCTX.m_pFaultAddress && __is_in_range(pRecord->m_pAddress, pRecord->m_unSize, PostCTX.m_pFaultAddress)) {
+						pRecord->m_pPostCallBack(pCTX, PostCTX.m_pExceptionAddress ? PostCTX.m_pExceptionAddress : reinterpret_cast<void*>(Exception.ExceptionAddress), PostCTX.m_unOperation, pRecord->m_pAddress, PostCTX.m_pFaultAddress);
+					}
+				}
+
+				bool bNeedErase = false;
+
+				AcquireSRWLockExclusive(&pRecord->m_Lock);
+				{
+					const uint32_t unPrev = pRecord->m_unActiveThreads.fetch_sub(1, std::memory_order_acq_rel);
+					if (unPrev == 1) {
+						if (!pRecord->m_bPendingDeletion) {
+							for (const auto& pPage : pRecord->m_Pages) {
+								if (!pPage || !pPage->ChangeProtection(PAGE_NOACCESS)) {
+									ReleaseSRWLockExclusive(&pRecord->m_Lock);
+									return false;
+								}
+							}
+						} else {
+							bNeedErase = true;
+						}
+					}
+				}
+				ReleaseSRWLockExclusive(&pRecord->m_Lock);
+
+				if (bNeedErase) {
+					AcquireSRWLockExclusive(&g_MemoryHookRecordsLock);
+					{
+						for (auto it = g_MemoryHookRecords.begin(); it != g_MemoryHookRecords.end(); ++it) {
+							if (it->get() == pRecord) {
+								g_MemoryHookRecords.erase(it);
+								break;
+							}
+						}
+					}
+					ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+				}
+
+				return true;
 			}
 
-			return false;
+			if ((Exception.ExceptionCode != EXCEPTION_ACCESS_VIOLATION) || (Exception.NumberParameters < 2)) {
+				return false;
+			}
+
+			const ULONG_PTR unAccessType = Exception.ExceptionInformation[0];
+			if ((unAccessType != 0) && (unAccessType != 1) && (unAccessType != 8)) {
+				return false;
+			}
+
+			void* pFaultAddress = reinterpret_cast<void*>(Exception.ExceptionInformation[1]);
+			if (!pFaultAddress || (pFaultAddress == reinterpret_cast<void*>(-1))) {
+				return false;
+			}
+
+			void* pExceptionAddress = reinterpret_cast<void*>(Exception.ExceptionAddress);
+
+			MEMORY_HOOK_OPERATION unOperation = MEMORY_HOOK_OPERATION::MEMORY_READ;
+			if (unAccessType == 1) {
+				unOperation = MEMORY_HOOK_OPERATION::MEMORY_WRITE;
+			} else if (unAccessType == 8) {
+				unOperation = MEMORY_HOOK_OPERATION::MEMORY_EXECUTE;
+			}
+
+			PMEMORY_HOOK_RECORD pTargetRecord = nullptr;
+
+			AcquireSRWLockShared(&g_MemoryHookRecordsLock);
+			{
+				for (const auto& pRecord : g_MemoryHookRecords) {
+					if (!pRecord) {
+						continue;
+					}
+
+					for (const auto& pPage : pRecord->m_Pages) {
+						if (pPage && __is_in_range(pPage->GetPageAddress(), pPage->GetPageCapacity(), pFaultAddress)) {
+							pTargetRecord = pRecord.get();
+							break;
+						}
+					}
+
+					if (pTargetRecord) {
+						break;
+					}
+				}
+			}
+			ReleaseSRWLockShared(&g_MemoryHookRecordsLock);
+
+			if (!pTargetRecord) {
+				return false;
+			}
+
+			AcquireSRWLockExclusive(&pTargetRecord->m_Lock);
+			{
+				const uint32_t unPrev = pTargetRecord->m_unActiveThreads.load(std::memory_order_acquire);
+				if (unPrev == 0) {
+					for (const auto& pPage : pTargetRecord->m_Pages) {
+						if (!pPage || !pPage->RestoreProtection()) {
+							ReleaseSRWLockExclusive(&pTargetRecord->m_Lock);
+							return false;
+						}
+					}
+				}
+
+				pTargetRecord->m_unActiveThreads.fetch_add(1, std::memory_order_acq_rel);
+			}
+			ReleaseSRWLockExclusive(&pTargetRecord->m_Lock);
+
+			AcquireSRWLockExclusive(&g_MemoryHookStacksLock);
+			{
+				g_MemoryHookOpenedStacks[unCurrentTID].push_back(pTargetRecord);
+
+				MEMORY_HOOK_POST_CONTEXT PostCTX = {};
+
+				PostCTX.m_pRecord = pTargetRecord;
+				PostCTX.m_pExceptionAddress = pExceptionAddress;
+				PostCTX.m_pFaultAddress = pFaultAddress;
+				PostCTX.m_unOperation = unOperation;
+
+				g_MemoryHookPostStacks[unCurrentTID].push_back(PostCTX);
+			}
+			ReleaseSRWLockExclusive(&g_MemoryHookStacksLock);
+
+			eflags.m_unTF = 1;
+
+			if (__is_in_range(pTargetRecord->m_pAddress, pTargetRecord->m_unSize, pFaultAddress)) {
+				pTargetRecord->m_pCallBack(pCTX, pExceptionAddress, unOperation, pTargetRecord->m_pAddress, pFaultAddress);
+			}
+
+			return true;
 		}
 
 		// ----------------------------------------------------------------
@@ -6259,6 +8421,20 @@ namespace Detours {
 				return false;
 			}
 
+			if (Exception.NumberParameters != 2) {
+				return false;
+			}
+
+			const ULONG_PTR unAccessType = Exception.ExceptionInformation[0];
+			if (unAccessType != 0) {
+				return false;
+			}
+
+			const void* pAccessAddress = reinterpret_cast<void*>(Exception.ExceptionInformation[1]);
+			if (pAccessAddress != reinterpret_cast<void*>(-1)) {
+				return false;
+			}
+
 			unsigned char* pCode = reinterpret_cast<unsigned char*>(Exception.ExceptionAddress);
 			if (pCode[0] != 0xCD) {
 				return false;
@@ -6266,22 +8442,22 @@ namespace Detours {
 
 			const unsigned char unInterrupt = pCode[1];
 
-			for (auto it = g_InterruptHooks.begin(); it != g_InterruptHooks.end(); ++it) {
-				const auto& pHook = it->second;
-				if (!pHook) {
+			for (auto it = g_InterruptHookRecords.begin(); it != g_InterruptHookRecords.end(); ++it) {
+				const auto& pRecord = *it;
+				if (!pRecord) {
 					continue;
 				}
 
-				if (pHook->GetInterrupt() != unInterrupt) {
+				if (pRecord->m_unInterrupt != unInterrupt) {
 					continue;
 				}
 
-				const auto& pCallBack = pHook->GetCallBack();
+				const auto& pCallBack = pRecord->m_pCallBack;
 				if (!pCallBack) {
 					return false;
 				}
 
-				if (pCallBack(pHook, pCTX)) {
+				if (pCallBack(pCTX, unInterrupt)) {
 #ifdef _M_X64
 					pCTX->Rip += 2;
 #elif _M_IX86
@@ -6303,6 +8479,7 @@ namespace Detours {
 			if (m_pVEH) {
 
 				// Built-in CallBacks
+				AddCallBack(HardwareHookCallBack); // Hardware Hooks
 				AddCallBack(MemoryHookCallBack); // Memory Hooks
 				AddCallBack(InterruptHookCallBack); // Interrupt Hooks
 			}
@@ -6313,8 +8490,9 @@ namespace Detours {
 				RemoveVectoredExceptionHandler(m_pVEH);
 
 				// Built-in CallBacks
-				RemoveCallBack(MemoryHookCallBack); // Memory Hooks
 				RemoveCallBack(InterruptHookCallBack); // Interrupt Hooks
+				RemoveCallBack(MemoryHookCallBack); // Memory Hooks
+				RemoveCallBack(HardwareHookCallBack); // Hardware Hooks
 			}
 		}
 
@@ -66718,7 +68896,6 @@ namespace Detours {
 
 		RD_TABLE const* g_pVexTable = reinterpret_cast<RD_TABLE const*>(&g_pVexTable_root_mmmmm);
 
-
 		static const RD_TABLE_INSTRUCTION g_pEvexTable_root_02_9a_03_mem_02_00_leaf = {
 			RD_ILUT_INSTRUCTION, reinterpret_cast<const void*>(&g_pInstructions[1400])
 		};
@@ -81175,8 +83352,7 @@ namespace Detours {
 				if ((pInstruction->DefCode != RD_CODE_64) && (pIns->m_unAttributes & RD_FLAG_O64)) {
 					unStatus = RD_STATUS_INVALID_ENCODING_IN_MODE;
 				}
-			}
-			else {
+			} else {
 				unStatus = RD_STATUS_INVALID_ENCODING;
 			}
 
@@ -83273,6 +85449,29 @@ namespace Detours {
 
 			return RD_STATUS_SUCCESS;
 		}
+
+		void* RdGetAddressFromRelOrDisp(void* pAddress) {
+			if (!pAddress) {
+				return nullptr;
+			}
+
+			INSTRUCTION ins;
+#ifdef _M_X64
+			if (!RD_SUCCESS(RdDecode(&ins, reinterpret_cast<unsigned char*>(pAddress), RD_CODE_64, RD_DATA_64))) {
+#elif _M_IX86
+			if (!RD_SUCCESS(RdDecode(&ins, reinterpret_cast<unsigned char*>(pAddress), RD_CODE_32, RD_DATA_32))) {
+#endif
+				return nullptr;
+			}
+
+			if (ins.IsRipRelative && ins.HasDisp) {
+				return reinterpret_cast<char*>(pAddress) + ins.Displacement + ins.Length;
+			} else if (ins.HasRelOffs) {
+				return reinterpret_cast<char*>(pAddress) + ins.RelativeOffset + ins.Length;
+			}
+
+			return nullptr;
+		}
 	}
 
 	// ----------------------------------------------------------------
@@ -83282,276 +85481,482 @@ namespace Detours {
 	namespace Hook {
 
 		// ----------------------------------------------------------------
-		// Memory Hook
+		// Hardware Hook
 		// ----------------------------------------------------------------
 
-		MemoryHook::MemoryHook(void* pAddress, size_t unSize, bool bAutoDisable) {
-			m_pAddress = pAddress;
-			m_unSize = unSize;
-			m_bAutoDisable = bAutoDisable;
-			m_pCallBack = nullptr;
-		}
-
-		MemoryHook::~MemoryHook() {
-			UnHook();
-		}
-
-		bool MemoryHook::Hook(const fnMemoryHookCallBack pCallBack) {
-			if (!m_pAddress || !m_unSize || m_pCallBack || !pCallBack) {
+		bool HookHardware(DWORD unThreadID, HARDWARE_HOOK_REGISTER unRegister, const fnHardwareHookCallBack pCallBack, void* pAddress, HARDWARE_HOOK_TYPE unType, unsigned char unSize) {
+			if (!g_Suspender.Suspend()) {
 				return false;
 			}
 
-			const auto& it = g_Protections.find(m_pAddress);
-			if (it != g_Protections.end()) {
+			if (!unThreadID || !pAddress || !unSize || !pCallBack) {
+				g_Suspender.Resume();
 				return false;
 			}
 
-			auto pProtection = std::make_unique<Protection>(m_pAddress, m_unSize);
-			if (!pProtection) {
+			if (unType == HARDWARE_HOOK_TYPE::TYPE_EXECUTE) {
+				if (unSize != 1) {
+					g_Suspender.Resume();
+					return false;
+				}
+			} else {
+#ifdef _M_X64
+				if ((unSize != 1) && (unSize != 2) && (unSize != 4) && (unSize != 8)) {
+#elif _M_IX86
+				if ((unSize != 1) && (unSize != 2) && (unSize != 4)) {
+#endif
+					g_Suspender.Resume();
+					return false;
+				}
+				if ((reinterpret_cast<size_t>(pAddress) & (unSize - 1)) != 0) {
+					g_Suspender.Resume();
+					return false;
+				}
+			}
+
+			AcquireSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+			for (auto& pRecord : g_HardwareHookRecords) {
+				if (pRecord && !pRecord->m_bPendingDeletion.load(std::memory_order_acquire)) {
+					if (pRecord->m_unThreadID == unThreadID && pRecord->m_unRegister == unRegister) {
+						ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
+						g_Suspender.Resume();
+						return false;
+					}
+				}
+			}
+
+			ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+			HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, unThreadID);
+			if (!hThread || (hThread == INVALID_HANDLE_VALUE)) {
+				g_Suspender.Resume();
 				return false;
 			}
 
-			DWORD unProtection = 0;
-			if (!pProtection->GetProtection(&unProtection)) {
+			CONTEXT ctx = { 0 };
+			ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+			if (!GetThreadContext(hThread, &ctx)) {
+				CloseHandle(hThread);
+				g_Suspender.Resume();
 				return false;
 			}
 
-			unProtection &= ~(PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE);
+			unsigned char unDRIndex = 0;
+			switch (unRegister) {
+				case HARDWARE_HOOK_REGISTER::REGISTER_DR0:
+#ifdef _M_X64
+						ctx.Dr0 = reinterpret_cast<DWORD64>(pAddress);
+#elif _M_IX86
+						ctx.Dr0 = reinterpret_cast<DWORD>(pAddress);
+#endif
+						unDRIndex = 0;
+						break;
 
-			if (!unProtection) {
-				unProtection |= PAGE_READONLY;
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR1:
+#ifdef _M_X64
+						ctx.Dr1 = reinterpret_cast<DWORD64>(pAddress);
+#elif _M_IX86
+						ctx.Dr1 = reinterpret_cast<DWORD>(pAddress);
+#endif
+						unDRIndex = 1;
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR2:
+#ifdef _M_X64
+						ctx.Dr2 = reinterpret_cast<DWORD64>(pAddress);
+#elif _M_IX86
+						ctx.Dr2 = reinterpret_cast<DWORD>(pAddress);
+#endif
+						unDRIndex = 2;
+						break;
+
+					case HARDWARE_HOOK_REGISTER::REGISTER_DR3:
+#ifdef _M_X64
+						ctx.Dr3 = reinterpret_cast<DWORD64>(pAddress);
+#elif _M_IX86
+						ctx.Dr3 = reinterpret_cast<DWORD>(pAddress);
+#endif
+						unDRIndex = 3;
+						break;
 			}
 
-			if (!pProtection->ChangeProtection(unProtection)) {
+			unsigned char unTypeValue = 0;
+			switch (unType) {
+				case HARDWARE_HOOK_TYPE::TYPE_EXECUTE:
+					unTypeValue = 0;
+					break;
+
+				case HARDWARE_HOOK_TYPE::TYPE_WRITE:
+					unTypeValue = 1;
+					break;
+
+				case HARDWARE_HOOK_TYPE::TYPE_ACCESS:
+					unTypeValue = 3;
+					break;
+			}
+
+			unsigned char unSizeValue = 0;
+			switch (unSize) {
+				case 1:
+					unSizeValue = 0;
+					break;
+
+				case 2:
+					unSizeValue = 1;
+					break;
+
+				case 4:
+					unSizeValue = 3;
+					break;
+
+#ifdef _M_X64
+				case 8:
+					unSizeValue = 2;
+					break;
+#endif
+			}
+
+			auto& dr7 = *reinterpret_cast<REGISTER_DR7*>(&ctx.Dr7);
+
+			switch (unDRIndex) {
+				case 0:
+					dr7.m_unL0 = 0;
+					dr7.m_unRW0 = 0;
+					dr7.m_unLEN0 = 0;
+					break;
+
+				case 1:
+					dr7.m_unL1 = 0;
+					dr7.m_unRW1 = 0;
+					dr7.m_unLEN1 = 0;
+					break;
+
+				case 2:
+					dr7.m_unL2 = 0;
+					dr7.m_unRW2 = 0;
+					dr7.m_unLEN2 = 0;
+					break;
+
+				case 3:
+					dr7.m_unL3 = 0;
+					dr7.m_unRW3 = 0;
+					dr7.m_unLEN3 = 0;
+					break;
+			}
+
+			switch (unDRIndex) {
+				case 0:
+					dr7.m_unL0 = 1;
+					dr7.m_unRW0 = unTypeValue;
+					dr7.m_unLEN0 = unSizeValue;
+					break;
+
+				case 1:
+					dr7.m_unL1 = 1;
+					dr7.m_unRW1 = unTypeValue;
+					dr7.m_unLEN1 = unSizeValue;
+					break;
+
+				case 2:
+					dr7.m_unL2 = 1;
+					dr7.m_unRW2 = unTypeValue;
+					dr7.m_unLEN2 = unSizeValue;
+					break;
+
+				case 3:
+					dr7.m_unL3 = 1;
+					dr7.m_unRW3 = unTypeValue;
+					dr7.m_unLEN3 = unSizeValue;
+					break;
+			}
+
+			if (!SetThreadContext(hThread, &ctx)) {
+				CloseHandle(hThread);
+				g_Suspender.Resume();
 				return false;
 			}
 
-			g_Protections.emplace_hint(it, m_pAddress, std::move(pProtection));
+			auto pRecord = std::make_unique<HARDWARE_HOOK_RECORD>();
+			if (!pRecord) {
+				CloseHandle(hThread);
+				g_Suspender.Resume();
+				return false;
+			}
 
-			m_pCallBack = pCallBack;
+			pRecord->m_unThreadID = unThreadID;
+			pRecord->m_unRegister = unRegister;
+			pRecord->m_pCallBack = pCallBack;
+			pRecord->m_pAddress = pAddress;
+			pRecord->m_unType = unType;
+			pRecord->m_unSize = unSize;
+			pRecord->m_bPendingRestore.store(false, std::memory_order_relaxed);
+			pRecord->m_bPendingDeletion.store(false, std::memory_order_relaxed);
+			pRecord->m_bCancelRestore.store(false, std::memory_order_relaxed);
 
+			AcquireSRWLockExclusive(&g_HardwareHookRecordsLock);
+			g_HardwareHookRecords.emplace_back(std::move(pRecord));
+			ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+			CloseHandle(hThread);
+			g_Suspender.Resume();
 			return true;
 		}
 
-		bool MemoryHook::UnHook() {
-			if (!m_pAddress || !m_unSize || !m_pCallBack) {
+		bool UnHookHardware(DWORD unThreadID, HARDWARE_HOOK_REGISTER unRegister) {
+			if (!g_Suspender.Suspend()) {
 				return false;
 			}
 
-			const auto& it = g_Protections.find(m_pAddress);
-			if (it == g_Protections.end()) {
+			if (!unThreadID) {
+				g_Suspender.Resume();
 				return false;
 			}
 
-			const auto& pProtection = it->second;
-			if (!pProtection) {
-				return false;
+			AcquireSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+			for (auto it = g_HardwareHookRecords.begin(); it != g_HardwareHookRecords.end(); ++it) {
+				auto& pRecord = *it;
+				if (!pRecord || pRecord->m_bPendingDeletion.load(std::memory_order_acquire)) {
+					continue;
+				}
+
+				if (pRecord->m_unThreadID != unThreadID || pRecord->m_unRegister != unRegister) {
+					continue;
+				}
+
+				if (pRecord->m_bPendingRestore.load(std::memory_order_acquire)) {
+					pRecord->m_bCancelRestore.store(true, std::memory_order_release);
+					pRecord->m_bPendingDeletion.store(true, std::memory_order_release);
+					ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
+					g_Suspender.Resume();
+					return true;
+				}
+
+				ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+				HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, unThreadID);
+				if (hThread && (hThread != INVALID_HANDLE_VALUE)) {
+					CONTEXT ctx = {};
+					ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+					if (GetThreadContext(hThread, &ctx)) {
+						auto& dr7 = *reinterpret_cast<REGISTER_DR7*>(&ctx.Dr7);
+						switch (unRegister) {
+						case HARDWARE_HOOK_REGISTER::REGISTER_DR0:
+							ctx.Dr0 = 0;
+							dr7.m_unL0 = 0;
+							dr7.m_unG0 = 0;
+							dr7.m_unRW0 = 0;
+							dr7.m_unLEN0 = 0;
+							break;
+
+						case HARDWARE_HOOK_REGISTER::REGISTER_DR1:
+							ctx.Dr1 = 0;
+							dr7.m_unL1 = 0;
+							dr7.m_unG1 = 0;
+							dr7.m_unRW1 = 0;
+							dr7.m_unLEN1 = 0;
+							break;
+
+						case HARDWARE_HOOK_REGISTER::REGISTER_DR2:
+							ctx.Dr2 = 0;
+							dr7.m_unL2 = 0;
+							dr7.m_unG2 = 0;
+							dr7.m_unRW2 = 0;
+							dr7.m_unLEN2 = 0;
+							break;
+
+						case HARDWARE_HOOK_REGISTER::REGISTER_DR3:
+							ctx.Dr3 = 0;
+							dr7.m_unL3 = 0;
+							dr7.m_unG3 = 0;
+							dr7.m_unRW3 = 0;
+							dr7.m_unLEN3 = 0;
+							break;
+					}
+
+						SetThreadContext(hThread, &ctx);
+					}
+					CloseHandle(hThread);
+				}
+
+				AcquireSRWLockExclusive(&g_HardwareHookRecordsLock);
+				pRecord->m_bPendingDeletion.store(true, std::memory_order_release);
+				g_HardwareHookRecords.erase(it);
+				ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
+
+				g_Suspender.Resume();
+				return true;
 			}
 
-			if (!pProtection->RestoreProtection()) {
-				return false;
-			}
+			ReleaseSRWLockExclusive(&g_HardwareHookRecordsLock);
 
-			g_Protections.erase(it);
-
-			m_pCallBack = nullptr;
-
-			return true;
-		}
-
-		bool MemoryHook::Enable() {
-			if (!m_pAddress || !m_unSize || !m_pCallBack) {
-				return false;
-			}
-
-			const auto& it = g_Protections.find(m_pAddress);
-			if (it == g_Protections.end()) {
-				return false;
-			}
-
-			const auto& pProtection = it->second;
-			if (!pProtection) {
-				return false;
-			}
-
-			DWORD unProtection = 0;
-			if (!pProtection->GetProtection(&unProtection)) {
-				return false;
-			}
-
-			unProtection &= ~(PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE);
-
-			if (!unProtection) {
-				unProtection |= PAGE_READONLY;
-			}
-
-			const bool bSuccess = pProtection->ChangeProtection(unProtection);
-
-			return bSuccess;
-		}
-
-		bool MemoryHook::Disable() {
-			if (!m_pAddress || !m_unSize || !m_pCallBack) {
-				return false;
-			}
-
-			const auto& it = g_Protections.find(m_pAddress);
-			if (it == g_Protections.end()) {
-				return false;
-			}
-
-			const auto& pProtection = it->second;
-			if (!pProtection) {
-				return false;
-			}
-
-			const bool bSuccess = pProtection->RestoreProtection();
-
-			return bSuccess;
-		}
-
-		void* MemoryHook::GetAddress() const {
-			return m_pAddress;
-		}
-
-		size_t MemoryHook::GetSize() const {
-			return m_unSize;
-		}
-
-		bool MemoryHook::IsAutoDisable() const {
-			return m_bAutoDisable;
-		}
-
-		fnMemoryHookCallBack MemoryHook::GetCallBack() const {
-			return m_pCallBack;
+			g_Suspender.Resume();
+			return false;
 		}
 
 		// ----------------------------------------------------------------
 		// Memory Hook
 		// ----------------------------------------------------------------
 
-		bool HookMemory(void* pAddress, const fnMemoryHookCallBack pCallBack, bool bAutoDisable) {
-			if (!pAddress || !pCallBack) {
+		bool HookMemory(const fnMemoryHookCallBack pCallBack, void* pAddress, size_t unSize, const fnMemoryHookCallBack pPostCallBack) {
+			if (!g_Suspender.Suspend()) {
 				return false;
 			}
 
-			const auto& it = g_MemoryHooks.find(reinterpret_cast<void*>(pCallBack));
-			if (it != g_MemoryHooks.end()) {
+			if (!pCallBack || !pAddress || !unSize) {
+				g_Suspender.Resume();
 				return false;
 			}
 
-			auto pHook = std::make_unique<MemoryHook>(pAddress, 1, bAutoDisable);
-			if (!pHook) {
+			auto vecPages = __get_pages_info(pAddress, unSize, true);
+			if (vecPages.empty()) {
+				g_Suspender.Resume();
 				return false;
 			}
 
-			if (!pHook->Hook(pCallBack)) {
+			bool bAllCommitted = true;
+			for (const auto& pi : vecPages) {
+				if (pi.m_unState != MEM_COMMIT) {
+					bAllCommitted = false;
+					break;
+				}
+			}
+
+			if (!bAllCommitted) {
+				g_Suspender.Resume();
 				return false;
 			}
 
-			g_MemoryHooks.emplace_hint(it, pCallBack, std::move(pHook));
+			AcquireSRWLockExclusive(&g_MemoryHookRecordsLock);
 
+			{
+				for (auto& pRecord : g_MemoryHookRecords) {
+					if (pRecord->m_bPendingDeletion) {
+						continue;
+					}
+
+					if (pRecord->m_pCallBack == pCallBack) {
+						ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+						g_Suspender.Resume();
+						return false;
+					}
+
+					if (__is_range_in_range(pRecord->m_pAddress, pRecord->m_unSize, pAddress, unSize)) {
+						ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+						g_Suspender.Resume();
+						return false;
+					}
+
+					auto vecRecordPages = __get_pages_info(pRecord->m_pAddress, pRecord->m_unSize, true);
+					if (vecRecordPages.empty()) {
+						continue;
+					}
+
+					for (const auto& pPage : vecPages) {
+						for (const auto& pRecordPage : vecRecordPages) {
+							if (__is_range_in_range(pRecordPage.m_pBaseAddress, pRecordPage.m_unSize, pPage.m_pBaseAddress, pPage.m_unSize)) {
+								ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+								g_Suspender.Resume();
+								return false;
+							}
+						}
+					}
+				}
+
+				auto pRecord = std::make_unique<MEMORY_HOOK_RECORD>();
+				if (!pRecord) {
+					ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+					g_Suspender.Resume();
+					return false;
+				}
+
+				pRecord->m_pCallBack = pCallBack;
+				pRecord->m_pPostCallBack = pPostCallBack;
+				pRecord->m_pAddress = pAddress;
+				pRecord->m_unSize = unSize;
+
+				for (auto& pi : vecPages) {
+					auto pPage = std::make_unique<Page>(pi.m_pBaseAddress, false);
+					if (!pPage) {
+						ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+						g_Suspender.Resume();
+						return false;
+					}
+
+					if (!pPage->ChangeProtection(PAGE_NOACCESS)) {
+						ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+						g_Suspender.Resume();
+						return false;
+					}
+
+					pRecord->m_Pages.emplace_back(std::move(pPage));
+				}
+
+				g_MemoryHookRecords.emplace_back(std::move(pRecord));
+			}
+
+			ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+
+			g_Suspender.Resume();
 			return true;
 		}
 
 		bool UnHookMemory(const fnMemoryHookCallBack pCallBack) {
+			if (!g_Suspender.Suspend()) {
+				return false;
+			}
+
 			if (!pCallBack) {
+				g_Suspender.Resume();
 				return false;
 			}
 
-			const auto& it = g_MemoryHooks.find(reinterpret_cast<void*>(pCallBack));
-			if (it == g_MemoryHooks.end()) {
-				return false;
+			AcquireSRWLockExclusive(&g_MemoryHookRecordsLock);
+
+			for (auto it = g_MemoryHookRecords.begin(); it != g_MemoryHookRecords.end(); ++it) {
+				auto& pRecord = *it;
+				if (pRecord && pRecord->m_pCallBack == pCallBack) {
+
+					AcquireSRWLockExclusive(&pRecord->m_Lock);
+
+					if (pRecord->m_bPendingDeletion) {
+						ReleaseSRWLockExclusive(&pRecord->m_Lock);
+						ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+						g_Suspender.Resume();
+						return true;
+					}
+
+					for (auto& pPage : pRecord->m_Pages) {
+						if (!pPage || !pPage->RestoreProtection()) {
+							ReleaseSRWLockExclusive(&pRecord->m_Lock);
+							ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+							g_Suspender.Resume();
+							return false;
+						}
+					}
+
+					pRecord->m_bPendingDeletion = true;
+
+					if (pRecord->m_unActiveThreads.load(std::memory_order_acquire) == 0) {
+						ReleaseSRWLockExclusive(&pRecord->m_Lock);
+						g_MemoryHookRecords.erase(it);
+					} else {
+						ReleaseSRWLockExclusive(&pRecord->m_Lock);
+					}
+
+					ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
+					g_Suspender.Resume();
+					return true;
+				}
 			}
 
-			const auto& pHook = it->second;
-			if (!pHook) {
-				return false;
-			}
+			ReleaseSRWLockExclusive(&g_MemoryHookRecordsLock);
 
-			pHook->UnHook();
-
-			g_MemoryHooks.erase(it);
-
-			return true;
+			g_Suspender.Resume();
+			return false;
 		}
 
-		bool EnableHookMemory(const fnMemoryHookCallBack pCallBack) {
-			if (!pCallBack) {
-				return false;
-			}
-
-			const auto& it = g_MemoryHooks.find(reinterpret_cast<void*>(pCallBack));
-			if (it == g_MemoryHooks.end()) {
-				return false;
-			}
-
-			const auto& pHook = it->second;
-			if (!pHook) {
-				return false;
-			}
-
-			return pHook->Enable();
-		}
-
-		bool DisableHookMemory(const fnMemoryHookCallBack pCallBack) {
-			if (!pCallBack) {
-				return false;
-			}
-
-			const auto& it = g_MemoryHooks.find(reinterpret_cast<void*>(pCallBack));
-			if (it == g_MemoryHooks.end()) {
-				return false;
-			}
-
-			const auto& pHook = it->second;
-			if (!pHook) {
-				return false;
-			}
-
-			return pHook->Disable();
-		}
-
-		// ----------------------------------------------------------------
-		// Interrupt Hook
-		// ----------------------------------------------------------------
-
-		InterruptHook::InterruptHook(unsigned char unInterrupt) {
-			m_unInterrupt = unInterrupt;
-			m_pCallBack = nullptr;
-		}
-
-		InterruptHook::~InterruptHook() {
-			UnHook();
-		}
-
-		bool InterruptHook::Hook(const fnInterruptHookCallBack pCallBack) {
-			if (m_pCallBack || !pCallBack) {
-				return false;
-			}
-
-			m_pCallBack = pCallBack;
-
-			return true;
-		}
-
-		bool InterruptHook::UnHook() {
-			if (!m_pCallBack) {
-				return false;
-			}
-
-			m_pCallBack = nullptr;
-
-			return true;
-		}
-
-		unsigned char InterruptHook::GetInterrupt() const {
-			return m_unInterrupt;
-		}
-
-		fnInterruptHookCallBack InterruptHook::GetCallBack() const {
-			return m_pCallBack;
-		}
 
 		// ----------------------------------------------------------------
 		// Interrupt Hook
@@ -83562,22 +85967,21 @@ namespace Detours {
 				return false;
 			}
 
-			const auto& it = g_InterruptHooks.find(reinterpret_cast<void*>(pCallBack));
-			if (it != g_InterruptHooks.end()) {
+			for (auto& Record : g_InterruptHookRecords) {
+				if (Record->m_pCallBack == pCallBack) {
+					return false;
+				}
+			}
+
+			auto pRecord = std::make_unique<INTERRUPT_HOOK_RECORD>();
+			if (!pRecord) {
 				return false;
 			}
 
-			auto pHook = std::make_unique<InterruptHook>(unInterrupt);
-			if (!pHook) {
-				return false;
-			}
+			pRecord->m_pCallBack = pCallBack;
+			pRecord->m_unInterrupt = unInterrupt;
 
-			if (!pHook->Hook(pCallBack)) {
-				return false;
-			}
-
-			g_InterruptHooks.emplace_hint(it, pCallBack, std::move(pHook));
-
+			g_InterruptHookRecords.emplace_back(std::move(pRecord));
 			return true;
 		}
 
@@ -83586,21 +85990,14 @@ namespace Detours {
 				return false;
 			}
 
-			const auto& it = g_InterruptHooks.find(reinterpret_cast<void*>(pCallBack));
-			if (it == g_InterruptHooks.end()) {
-				return false;
+			for (auto it = g_InterruptHookRecords.begin(); it != g_InterruptHookRecords.end(); ++it) {
+				if ((*it)->m_pCallBack == pCallBack) {
+					g_InterruptHookRecords.erase(it);
+					return true;
+				}
 			}
 
-			const auto& pHook = it->second;
-			if (!pHook) {
-				return false;
-			}
-
-			pHook->UnHook();
-
-			g_InterruptHooks.erase(it);
-
-			return true;
+			return false;
 		}
 
 		// ----------------------------------------------------------------
@@ -83664,26 +86061,17 @@ namespace Detours {
 
 			const auto& pAddress = &m_pVTable[m_unIndex];
 
-			const auto& it = g_Protections.find(reinterpret_cast<void*>(pAddress));
-			if (it != g_Protections.end()) {
-				return false;
-			}
-
-			auto pProtection = std::make_unique<Protection>(pAddress, sizeof(void*));
-			if (!pProtection) {
-				return false;
-			}
-
-			if (!pProtection->ChangeProtection(PAGE_READWRITE)) {
+			Protection Patch(pAddress, sizeof(void*));
+			if (!Patch.Change(PAGE_READWRITE)) {
 				return false;
 			}
 
 			m_pOriginal = *pAddress;
 			*pAddress = pHookAddress;
 
-			pProtection->RestoreProtection();
-
-			g_Protections.emplace_hint(it, reinterpret_cast<void*>(pAddress), std::move(pProtection));
+			if (!Patch.Restore()) {
+				return false;
+			}
 
 			return true;
 		}
@@ -83695,26 +86083,17 @@ namespace Detours {
 
 			const auto& pAddress = &m_pVTable[m_unIndex];
 
-			const auto& it = g_Protections.find(reinterpret_cast<void*>(pAddress));
-			if (it == g_Protections.end()) {
-				return false;
-			}
-
-			const auto& pProtection = it->second;
-			if (!pProtection) {
-				return false;
-			}
-
-			if (!pProtection->ChangeProtection(PAGE_READWRITE)) {
+			Protection Patch(pAddress, sizeof(void*));
+			if (!Patch.Change(PAGE_READWRITE)) {
 				return false;
 			}
 
 			*pAddress = m_pOriginal;
 			m_pOriginal = nullptr;
 
-			pProtection->RestoreProtection();
-
-			g_Protections.erase(it);
+			if (!Patch.Restore()) {
+				return false;
+			}
 
 			return true;
 		}
@@ -83859,7 +86238,7 @@ namespace Detours {
 			return true;
 		}
 
-		bool InlineHook::Hook(void* pHookAddress, bool bSingleInstructionOnly) {
+		bool InlineHook::Hook(void* pHookAddress, bool bSingleInstructionOnly, bool bWaitForHook) {
 			if (!g_Suspender.Suspend()) {
 				return false;
 			}
@@ -83910,13 +86289,14 @@ namespace Detours {
 				return false;
 			}
 
-			m_pTrampoline = g_HookStorage.Alloc(HOOK_INLINE_TRAMPOLINE_SIZE, m_pAddress);
+			m_pTrampoline = g_HookStorage.Alloc(HOOK_INLINE_TRAMPOLINE_SIZE, 1, alignof(void*), m_pAddress);
 			if (!m_pTrampoline) {
 				g_Suspender.Resume();
 				return false;
 			}
 
-			if (!Protection(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE, false).ChangeProtection(PAGE_READWRITE)) {
+			Protection TrampolineProtection(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE, false);
+			if (!TrampolineProtection.Change(PAGE_READWRITE)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
 				g_Suspender.Resume();
@@ -83947,7 +86327,7 @@ namespace Detours {
 				return false;
 			}
 
-			memset(m_pTrampoline, 0xC3, HOOK_INLINE_TRAMPOLINE_SIZE);
+			memset(m_pTrampoline, 0xCC, HOOK_INLINE_TRAMPOLINE_SIZE);
 			memcpy(m_pTrampoline, m_pAddress, unCopyingSize);
 
 			for (size_t unIndex = 0; unIndex < unCopyingSize;) {
@@ -83970,12 +86350,12 @@ namespace Detours {
 					const size_t unNewDisp = unTargetAddress - unTrampolineAddress;
 
 					switch (ins.DispLength) {
-						case 1: // FIXME: Impossible to do. (FIX: Replace disp8 with disp32)
-							*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned char>(unNewDisp & 0xFF);
-							break;
-						case 2: // FIXME: Possible crash. (FIX: Same as with disp8)
-							*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned short>(unNewDisp & 0xFFFF);
-							break;
+						//case 1: // FIXME: Impossible to do. (FIX: Replace disp8 with disp32)
+						//	*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned char>(unNewDisp & 0xFF);
+						//	break;
+						//case 2: // FIXME: Possible crash. (FIX: Same as with disp8)
+						//	*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned short>(unNewDisp & 0xFFFF);
+						//	break;
 						case 4:
 							*reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned int>(unNewDisp & 0xFFFFFFFF);
 							break;
@@ -83990,12 +86370,12 @@ namespace Detours {
 					const size_t unNewOffset = unTargetAddress - unTrampolineAddress;
 
 					switch (ins.RelOffsLength) {
-						case 1: // FIXME: Impossible to do. (FIX: Replace rel8 with rel32)
-							*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned char>(unNewOffset & 0xFF);
-							break;
-						case 2: // FIXME: Possible crash. (FIX: Same as with rel8)
-							*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned short>(unNewOffset & 0xFFFF);
-							break;
+						//case 1: // FIXME: Impossible to do. (FIX: Replace rel8 with rel32)
+						//	*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned char>(unNewOffset & 0xFF);
+						//	break;
+						//case 2: // FIXME: Possible crash. (FIX: Same as with rel8)
+						//	*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned short>(unNewOffset & 0xFFFF);
+						//	break;
 						case 4:
 							*reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned int>(unNewOffset & 0xFFFFFFFF);
 							break;
@@ -84027,9 +86407,9 @@ namespace Detours {
 				pJumpFromTrampoline[ 1] = 0x44;
 				pJumpFromTrampoline[ 2] = 0x24;
 				pJumpFromTrampoline[ 3] = 0xF8;
-				
+
 				*reinterpret_cast<unsigned int*>(pJumpFromTrampoline + 4) = unAddress & 0xFFFFFFFF;
-				
+
 				pJumpFromTrampoline[ 8] = 0xC7;
 				pJumpFromTrampoline[ 9] = 0x44;
 				pJumpFromTrampoline[10] = 0x24;
@@ -84059,7 +86439,7 @@ namespace Detours {
 #endif
 			}
 
-			if (!Protection(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE, false).ChangeProtection(PAGE_EXECUTE_READ)) {
+			if (!TrampolineProtection.Change(PAGE_EXECUTE_READ)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
 				g_Suspender.Resume();
@@ -84079,8 +86459,27 @@ namespace Detours {
 
 			memcpy(m_pOriginalBytes.get(), m_pAddress, unCopyingSize);
 
+			if (bWaitForHook) {
+				while (true) {
+					if (!g_Suspender.IsRegionExecuting(m_pAddress, unCopyingSize)) {
+						break;
+					}
+
+					g_Suspender.Resume();
+
+					if (!g_Suspender.Suspend()) {
+						m_pOriginalBytes = nullptr;
+						m_unOriginalBytes = 0;
+						g_HookStorage.DeAlloc(m_pTrampoline);
+						m_pTrampoline = nullptr;
+						g_Suspender.Resume();
+						return false;
+					}
+				}
+			}
+
 			Protection JumpToHookProtection(m_pAddress, unCopyingSize, false);
-			if (!JumpToHookProtection.ChangeProtection(PAGE_READWRITE)) {
+			if (!JumpToHookProtection.Change(PAGE_EXECUTE_READWRITE)) {
 				m_pOriginalBytes = nullptr;
 				m_unOriginalBytes = 0;
 				g_HookStorage.DeAlloc(m_pTrampoline);
@@ -84139,13 +86538,21 @@ namespace Detours {
 #endif
 			}
 
-			JumpToHookProtection.RestoreProtection();
+			if (!JumpToHookProtection.Restore()) {
+				m_pOriginalBytes = nullptr;
+				m_unOriginalBytes = 0;
+				g_HookStorage.DeAlloc(m_pTrampoline);
+				m_pTrampoline = nullptr;
+				__debugbreak();
+				g_Suspender.Resume();
+				return false;
+			}
 
 			g_Suspender.Resume();
 			return true;
 		}
 
-		bool InlineHook::UnHook() {
+		bool InlineHook::UnHook(bool bWaitForUnHook) {
 			if (!g_Suspender.Suspend()) {
 				return false;
 			}
@@ -84155,19 +86562,37 @@ namespace Detours {
 				return false;
 			}
 
-			for (size_t unIndex = 0; unIndex < HOOK_INLINE_TRAMPOLINE_SIZE; ++unIndex) {
-				g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pTrampoline) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress) + unIndex);
+			if (bWaitForUnHook) {
+				while (true) {
+					if (!g_Suspender.IsRegionExecuting(m_pAddress, m_unOriginalBytes) && !g_Suspender.IsRegionExecuting(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE) && !g_Suspender.IsRegionInCallStacks(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE)) {
+						break;
+					}
+
+					g_Suspender.Resume();
+
+					if (!g_Suspender.Suspend()) {
+						return false;
+					}
+				}
+			} else {
+				for (size_t unIndex = 0; unIndex < HOOK_INLINE_TRAMPOLINE_SIZE; ++unIndex) {
+					g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pTrampoline) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress) + unIndex);
+				}
 			}
 
 			Protection HookProtection(m_pAddress, m_unOriginalBytes, false);
-			if (!HookProtection.ChangeProtection(PAGE_READWRITE)) {
+			if (!HookProtection.Change(PAGE_EXECUTE_READWRITE)) {
 				g_Suspender.Resume();
 				return false;
 			}
 
 			memcpy(m_pAddress, m_pOriginalBytes.get(), m_unOriginalBytes);
 
-			HookProtection.RestoreProtection();
+			if (!HookProtection.Restore()) {
+				__debugbreak();
+				g_Suspender.Resume();
+				return false;
+			}
 
 			m_pOriginalBytes = nullptr;
 			m_unOriginalBytes = 0;
@@ -84240,7 +86665,7 @@ namespace Detours {
 			return true;
 		}
 
-		bool InlineWrapperHook::Hook(void* pHookAddress, bool bSingleInstructionOnly) {
+		bool InlineWrapperHook::Hook(void* pHookAddress, bool bSingleInstructionOnly, bool bWaitForHook) {
 			if (!g_Suspender.Suspend()) {
 				return false;
 			}
@@ -84250,20 +86675,21 @@ namespace Detours {
 				return false;
 			}
 
-			m_pWrapper = g_HookStorage.Alloc(HOOK_INLINE_WRAPPER_SIZE, m_pAddress);
+			m_pWrapper = g_HookStorage.Alloc(HOOK_INLINE_WRAPPER_SIZE, 1, alignof(void*), m_pAddress);
 			if (!m_pWrapper) {
 				g_Suspender.Resume();
 				return false;
 			}
 
-			if (!Protection(m_pWrapper, HOOK_INLINE_WRAPPER_SIZE, false).ChangeProtection(PAGE_READWRITE)) {
+			Protection WrapperProtection(m_pWrapper, HOOK_INLINE_WRAPPER_SIZE, false);
+			if (!WrapperProtection.Change(PAGE_READWRITE)) {
 				g_HookStorage.DeAlloc(m_pWrapper);
 				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
 
-			memset(m_pWrapper, 0xC3, HOOK_INLINE_WRAPPER_SIZE);
+			memset(m_pWrapper, 0xCC, HOOK_INLINE_WRAPPER_SIZE);
 
 			unsigned char* pJumpToHook = reinterpret_cast<unsigned char*>(m_pWrapper);
 #ifdef _M_X64
@@ -84314,6 +86740,8 @@ namespace Detours {
 				unJumpToWrapperSize = 5;
 			} else {
 				if (bSingleInstructionOnly) {
+					g_HookStorage.DeAlloc(m_pWrapper);
+					m_pWrapper = nullptr;
 					g_Suspender.Resume();
 					return false;
 				}
@@ -84337,6 +86765,8 @@ namespace Detours {
 #elif _M_IX86
 				if (!RD_SUCCESS(RdDecode(&ins, reinterpret_cast<unsigned char*>(m_pAddress) + unCopyingSize, RD_CODE_32, RD_DATA_32))) {
 #endif
+					g_HookStorage.DeAlloc(m_pWrapper);
+					m_pWrapper = nullptr;
 					g_Suspender.Resume();
 					return false;
 				}
@@ -84345,19 +86775,26 @@ namespace Detours {
 			}
 
 			if (unCopyingSize >= HOOK_INLINE_TRAMPOLINE_SIZE) {
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
 
-			m_pTrampoline = g_HookStorage.Alloc(HOOK_INLINE_TRAMPOLINE_SIZE, m_pAddress);
+			m_pTrampoline = g_HookStorage.Alloc(HOOK_INLINE_TRAMPOLINE_SIZE, 1, alignof(void*), m_pAddress);
 			if (!m_pTrampoline) {
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
 
-			if (!Protection(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE, false).ChangeProtection(PAGE_READWRITE)) {
+			Protection TrampolineProtection(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE, false);
+			if (!TrampolineProtection.Change(PAGE_READWRITE)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
@@ -84382,11 +86819,13 @@ namespace Detours {
 			if (unCopyingSize + unJumpFromTrampolineSize > HOOK_INLINE_TRAMPOLINE_SIZE) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
 
-			memset(m_pTrampoline, 0xC3, HOOK_INLINE_TRAMPOLINE_SIZE);
+			memset(m_pTrampoline, 0xCC, HOOK_INLINE_TRAMPOLINE_SIZE);
 			memcpy(m_pTrampoline, m_pAddress, unCopyingSize);
 
 			for (size_t unIndex = 0; unIndex < unCopyingSize;) {
@@ -84397,6 +86836,8 @@ namespace Detours {
 #endif
 					g_HookStorage.DeAlloc(m_pTrampoline);
 					m_pTrampoline = nullptr;
+					g_HookStorage.DeAlloc(m_pWrapper);
+					m_pWrapper = nullptr;
 					g_Suspender.Resume();
 					return false;
 				}
@@ -84409,18 +86850,20 @@ namespace Detours {
 					const size_t unNewDisp = unTargetAddress - unTrampolineAddress;
 
 					switch (ins.DispLength) {
-						case 1: // FIXME: Impossible to do. (FIX: Replace disp8 with disp32)
-							*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned char>(unNewDisp & 0xFF);
-							break;
-						case 2: // FIXME: Possible crash. (FIX: Same as with disp8)
-							*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned short>(unNewDisp & 0xFFFF);
-							break;
+						//case 1: // FIXME: Impossible to do. (FIX: Replace disp8 with disp32)
+						//	*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned char>(unNewDisp & 0xFF);
+						//	break;
+						//case 2: // FIXME: Possible crash. (FIX: Same as with disp8)
+						//	*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned short>(unNewDisp & 0xFFFF);
+						//	break;
 						case 4:
 							*reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned int>(unNewDisp & 0xFFFFFFFF);
 							break;
 						default:
 							g_HookStorage.DeAlloc(m_pTrampoline);
 							m_pTrampoline = nullptr;
+							g_HookStorage.DeAlloc(m_pWrapper);
+							m_pWrapper = nullptr;
 							g_Suspender.Resume();
 							return false;
 					}
@@ -84429,18 +86872,20 @@ namespace Detours {
 					const size_t unNewOffset = unTargetAddress - unTrampolineAddress;
 
 					switch (ins.RelOffsLength) {
-						case 1: // FIXME: Impossible to do. (FIX: Replace rel8 with rel32)
-							*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned char>(unNewOffset & 0xFF);
-							break;
-						case 2: // FIXME: Possible crash. (FIX: Same as with rel8)
-							*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned short>(unNewOffset & 0xFFFF);
-							break;
+						//case 1: // FIXME: Impossible to do. (FIX: Replace rel8 with rel32)
+						//	*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned char>(unNewOffset & 0xFF);
+						//	break;
+						//case 2: // FIXME: Possible crash. (FIX: Same as with rel8)
+						//	*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned short>(unNewOffset & 0xFFFF);
+						//	break;
 						case 4:
 							*reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned int>(unNewOffset & 0xFFFFFFFF);
 							break;
 						default:
 							g_HookStorage.DeAlloc(m_pTrampoline);
 							m_pTrampoline = nullptr;
+							g_HookStorage.DeAlloc(m_pWrapper);
+							m_pWrapper = nullptr;
 							g_Suspender.Resume();
 							return false;
 					}
@@ -84466,9 +86911,9 @@ namespace Detours {
 				pJumpFromTrampoline[ 1] = 0x44;
 				pJumpFromTrampoline[ 2] = 0x24;
 				pJumpFromTrampoline[ 3] = 0xF8;
-				
+
 				*reinterpret_cast<unsigned int*>(pJumpFromTrampoline + 4) = unAddress & 0xFFFFFFFF;
-				
+
 				pJumpFromTrampoline[ 8] = 0xC7;
 				pJumpFromTrampoline[ 9] = 0x44;
 				pJumpFromTrampoline[10] = 0x24;
@@ -84498,9 +86943,11 @@ namespace Detours {
 #endif
 			}
 
-			if (!Protection(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE, false).ChangeProtection(PAGE_EXECUTE_READ)) {
+			if (!TrampolineProtection.Change(PAGE_EXECUTE_READ)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
@@ -84512,18 +86959,43 @@ namespace Detours {
 				m_unOriginalBytes = 0;
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
 
 			memcpy(m_pOriginalBytes.get(), m_pAddress, unCopyingSize);
 
+			if (bWaitForHook) {
+				while (true) {
+					if (!g_Suspender.IsRegionExecuting(m_pAddress, unCopyingSize)) {
+						break;
+					}
+
+					g_Suspender.Resume();
+
+					if (!g_Suspender.Suspend()) {
+						m_pOriginalBytes = nullptr;
+						m_unOriginalBytes = 0;
+						g_HookStorage.DeAlloc(m_pTrampoline);
+						m_pTrampoline = nullptr;
+						g_HookStorage.DeAlloc(m_pWrapper);
+						m_pWrapper = nullptr;
+						g_Suspender.Resume();
+						return false;
+					}
+				}
+			}
+
 			Protection JumpToHookProtection(m_pAddress, unCopyingSize, false);
-			if (!JumpToHookProtection.ChangeProtection(PAGE_READWRITE)) {
+			if (!JumpToHookProtection.Change(PAGE_EXECUTE_READWRITE)) {
 				m_pOriginalBytes = nullptr;
 				m_unOriginalBytes = 0;
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
@@ -84578,13 +87050,23 @@ namespace Detours {
 #endif
 			}
 
-			JumpToHookProtection.RestoreProtection();
+			if (!JumpToHookProtection.Restore()) {
+				m_pOriginalBytes = nullptr;
+				m_unOriginalBytes = 0;
+				g_HookStorage.DeAlloc(m_pTrampoline);
+				m_pTrampoline = nullptr;
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
+				__debugbreak();
+				g_Suspender.Resume();
+				return false;
+			}
 
 			g_Suspender.Resume();
 			return true;
 		}
 
-		bool InlineWrapperHook::UnHook() {
+		bool InlineWrapperHook::UnHook(bool bWaitForUnHook) {
 			if (!g_Suspender.Suspend()) {
 				return false;
 			}
@@ -84594,23 +87076,41 @@ namespace Detours {
 				return false;
 			}
 
-			for (size_t unIndex = 0; unIndex < HOOK_INLINE_WRAPPER_SIZE; ++unIndex) {
-				g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pWrapper) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress));
-			}
+			if (bWaitForUnHook) {
+				while (true) {
+					if (!g_Suspender.IsRegionExecuting(m_pAddress, m_unOriginalBytes) && !g_Suspender.IsRegionExecuting(m_pWrapper, HOOK_INLINE_WRAPPER_SIZE) && !g_Suspender.IsRegionExecuting(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE) && !g_Suspender.IsRegionInCallStacks(m_pWrapper, HOOK_INLINE_WRAPPER_SIZE) && !g_Suspender.IsRegionInCallStacks(m_pTrampoline, HOOK_INLINE_TRAMPOLINE_SIZE)) {
+						break;
+					}
 
-			for (size_t unIndex = 0; unIndex < HOOK_INLINE_TRAMPOLINE_SIZE; ++unIndex) {
-				g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pTrampoline) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress) + unIndex);
+					g_Suspender.Resume();
+
+					if (!g_Suspender.Suspend()) {
+						return false;
+					}
+				}
+			} else {
+				for (size_t unIndex = 0; unIndex < HOOK_INLINE_WRAPPER_SIZE; ++unIndex) {
+					g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pWrapper) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress));
+				}
+
+				for (size_t unIndex = 0; unIndex < HOOK_INLINE_TRAMPOLINE_SIZE; ++unIndex) {
+					g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pTrampoline) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress) + unIndex);
+				}
 			}
 
 			Protection HookProtection(m_pAddress, m_unOriginalBytes, false);
-			if (!HookProtection.ChangeProtection(PAGE_READWRITE)) {
+			if (!HookProtection.Change(PAGE_EXECUTE_READWRITE)) {
 				g_Suspender.Resume();
 				return false;
 			}
 
 			memcpy(m_pAddress, m_pOriginalBytes.get(), m_unOriginalBytes);
 
-			HookProtection.RestoreProtection();
+			if (!HookProtection.Restore()) {
+				__debugbreak();
+				g_Suspender.Resume();
+				return false;
+			}
 
 			m_pOriginalBytes = nullptr;
 			m_unOriginalBytes = 0;
@@ -84689,7 +87189,7 @@ namespace Detours {
 			return true;
 		}
 
-		bool RawHook::Hook(const fnRawHookCallBack pCallBack, bool bNative, const unsigned int unReservedStackSize, bool bSingleInstructionOnly) {
+		bool RawHook::Hook(const fnRawHookCallBack pCallBack, bool bNative, const unsigned int unReservedStackSize, bool bSingleInstructionOnly, bool bWaitForHook) {
 			if (!g_Suspender.Suspend()) {
 				return false;
 			}
@@ -84699,20 +87199,21 @@ namespace Detours {
 				return false;
 			}
 
-			m_pWrapper = g_HookStorage.Alloc(HOOK_RAW_WRAPPER_SIZE, m_pAddress);
+			m_pWrapper = g_HookStorage.Alloc(HOOK_RAW_WRAPPER_SIZE, 1, alignof(void*), m_pAddress);
 			if (!m_pWrapper) {
 				g_Suspender.Resume();
 				return false;
 			}
 
-			if (!Protection(m_pWrapper, HOOK_RAW_WRAPPER_SIZE, false).ChangeProtection(PAGE_READWRITE)) {
+			Protection WrapperProtection(m_pWrapper, HOOK_RAW_WRAPPER_SIZE, false);
+			if (!WrapperProtection.Change(PAGE_READWRITE)) {
 				g_HookStorage.DeAlloc(m_pWrapper);
 				m_pWrapper = nullptr;
 				g_Suspender.Resume();
 				return false;
 			}
 
-			memset(m_pWrapper, 0xC3, HOOK_RAW_WRAPPER_SIZE);
+			memset(m_pWrapper, 0xCC, HOOK_RAW_WRAPPER_SIZE);
 
 			int cpuinfo[4];
 			__cpuid(cpuinfo, 1);
@@ -85747,7 +88248,7 @@ namespace Detours {
 				unCopyingSize += ins.Length;
 			}
 
-			m_pTrampoline = g_HookStorage.Alloc(HOOK_RAW_TRAMPOLINE_SIZE, m_pAddress);
+			m_pTrampoline = g_HookStorage.Alloc(HOOK_RAW_TRAMPOLINE_SIZE, 1, alignof(void*), m_pAddress);
 			if (!m_pTrampoline) {
 				m_unFirstInstructionSize = 0;
 				g_HookStorage.DeAlloc(m_pWrapper);
@@ -85756,7 +88257,8 @@ namespace Detours {
 				return false;
 			}
 
-			if (!Protection(m_pTrampoline, HOOK_RAW_TRAMPOLINE_SIZE, false).ChangeProtection(PAGE_READWRITE)) {
+			Protection TrampolineProtection(m_pTrampoline, HOOK_RAW_TRAMPOLINE_SIZE, false);
+			if (!TrampolineProtection.Change(PAGE_READWRITE)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
 				m_unFirstInstructionSize = 0;
@@ -85842,7 +88344,7 @@ namespace Detours {
 #endif
 			}
 
-			if (!Protection(m_pWrapper, HOOK_RAW_WRAPPER_SIZE, false).ChangeProtection(PAGE_EXECUTE_READ)) {
+			if (!WrapperProtection.Change(PAGE_EXECUTE_READ)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
 				m_unFirstInstructionSize = 0;
@@ -85852,7 +88354,7 @@ namespace Detours {
 				return false;
 			}
 
-			if (!Protection(m_pTrampoline, HOOK_RAW_TRAMPOLINE_SIZE, false).ChangeProtection(PAGE_READWRITE)) {
+			if (!TrampolineProtection.Change(PAGE_READWRITE)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
 				m_unFirstInstructionSize = 0;
@@ -85879,7 +88381,7 @@ namespace Detours {
 #endif
 			}
 
-			memset(m_pTrampoline, 0xC3, HOOK_RAW_TRAMPOLINE_SIZE);
+			memset(m_pTrampoline, 0xCC, HOOK_RAW_TRAMPOLINE_SIZE);
 			memcpy(m_pTrampoline, m_pAddress, unCopyingSize);
 
 			for (size_t unIndex = 0; unIndex < unCopyingSize;) {
@@ -85905,12 +88407,12 @@ namespace Detours {
 					const size_t unNewDisp = unTargetAddress - unTrampolineAddress;
 
 					switch (ins.DispLength) {
-						case 1: // FIXME: Impossible to do (FIX: Replace disp8 to disp32)
-							*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned char>(unNewDisp & 0xFF);
-							break;
-						case 2: // FIXME: Possible crash (FIX: Same as disp8)
-							*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned short>(unNewDisp & 0xFFFF);
-							break;
+						//case 1: // FIXME: Impossible to do (FIX: Replace disp8 to disp32)
+						//	*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned char>(unNewDisp & 0xFF);
+						//	break;
+						//case 2: // FIXME: Possible crash (FIX: Same as disp8)
+						//	*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned short>(unNewDisp & 0xFFFF);
+						//	break;
 						case 4:
 							*reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.DispOffset) = static_cast<unsigned int>(unNewDisp & 0xFFFFFFFF);
 							break;
@@ -85928,12 +88430,12 @@ namespace Detours {
 					const size_t unNewOffset = unTargetAddress - unTrampolineAddress;
 
 					switch (ins.RelOffsLength) {
-						case 1: // FIXME: Impossible to do (FIX: Replace rel8 to rel32)
-							*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned char>(unNewOffset & 0xFF);
-							break;
-						case 2: // FIXME: Possible error (FIX: Same as rel8)
-							*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned short>(unNewOffset & 0xFFFF);
-							break;
+						//case 1: // FIXME: Impossible to do (FIX: Replace rel8 to rel32)
+						//	*reinterpret_cast<unsigned char*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned char>(unNewOffset & 0xFF);
+						//	break;
+						//case 2: // FIXME: Possible error (FIX: Same as rel8)
+						//	*reinterpret_cast<unsigned short*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned short>(unNewOffset & 0xFFFF);
+						//	break;
 						case 4:
 							*reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(m_pTrampoline) + unIndex + ins.RelOffsOffset) = static_cast<unsigned int>(unNewOffset & 0xFFFFFFFF);
 							break;
@@ -86002,7 +88504,7 @@ namespace Detours {
 #endif
 			}
 
-			if (!Protection(m_pTrampoline, HOOK_RAW_TRAMPOLINE_SIZE, false).ChangeProtection(PAGE_EXECUTE_READ)) {
+			if (!TrampolineProtection.Change(PAGE_EXECUTE_READ)) {
 				g_HookStorage.DeAlloc(m_pTrampoline);
 				m_pTrampoline = nullptr;
 				m_unFirstInstructionSize = 0;
@@ -86028,8 +88530,29 @@ namespace Detours {
 
 			memcpy(m_pOriginalBytes.get(), m_pAddress, unCopyingSize);
 
+			if (bWaitForHook) {
+				while (true) {
+					if (!g_Suspender.IsRegionExecuting(m_pAddress, unCopyingSize)) {
+						break;
+					}
+
+					g_Suspender.Resume();
+
+					if (!g_Suspender.Suspend()) {
+						m_pOriginalBytes = nullptr;
+						m_unOriginalBytes = 0;
+						g_HookStorage.DeAlloc(m_pTrampoline);
+						m_pTrampoline = nullptr;
+						m_unFirstInstructionSize = 0;
+						g_HookStorage.DeAlloc(m_pWrapper);
+						m_pWrapper = nullptr;
+						return false;
+					}
+				}
+			}
+
 			Protection JumpToHookProtection(m_pAddress, unCopyingSize, false);
-			if (!JumpToHookProtection.ChangeProtection(PAGE_READWRITE)) {
+			if (!JumpToHookProtection.Change(PAGE_EXECUTE_READWRITE)) {
 				m_pOriginalBytes = nullptr;
 				m_unOriginalBytes = 0;
 				g_HookStorage.DeAlloc(m_pTrampoline);
@@ -86093,13 +88616,24 @@ namespace Detours {
 #endif
 			}
 
-			JumpToHookProtection.RestoreProtection();
+			if (!JumpToHookProtection.Restore()) {
+				m_pOriginalBytes = nullptr;
+				m_unOriginalBytes = 0;
+				g_HookStorage.DeAlloc(m_pTrampoline);
+				m_pTrampoline = nullptr;
+				m_unFirstInstructionSize = 0;
+				g_HookStorage.DeAlloc(m_pWrapper);
+				m_pWrapper = nullptr;
+				__debugbreak();
+				g_Suspender.Resume();
+				return false;
+			}
 
 			g_Suspender.Resume();
 			return true;
 		}
 
-		bool RawHook::UnHook() {
+		bool RawHook::UnHook(bool bWaitForUnHook) {
 			if (!g_Suspender.Suspend()) {
 				return false;
 			}
@@ -86109,23 +88643,41 @@ namespace Detours {
 				return false;
 			}
 
-			for (size_t unIndex = 0; unIndex < HOOK_RAW_WRAPPER_SIZE; ++unIndex) {
-				g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pWrapper) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress));
-			}
+			if (bWaitForUnHook) {
+				while (true) {
+					if (!g_Suspender.IsRegionExecuting(m_pAddress, m_unOriginalBytes) && !g_Suspender.IsRegionExecuting(m_pWrapper, HOOK_RAW_WRAPPER_SIZE) && !g_Suspender.IsRegionExecuting(m_pTrampoline, HOOK_RAW_TRAMPOLINE_SIZE) && !g_Suspender.IsRegionInCallStacks(m_pWrapper, HOOK_RAW_WRAPPER_SIZE) && !g_Suspender.IsRegionInCallStacks(m_pTrampoline, HOOK_RAW_TRAMPOLINE_SIZE)) {
+						break;
+					}
 
-			for (size_t unIndex = 0; unIndex < HOOK_RAW_TRAMPOLINE_SIZE; ++unIndex) {
-				g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pTrampoline) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress) + unIndex);
+					g_Suspender.Resume();
+
+					if (!g_Suspender.Suspend()) {
+						return false;
+					}
+				}
+			} else {
+				for (size_t unIndex = 0; unIndex < HOOK_RAW_WRAPPER_SIZE; ++unIndex) {
+					g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pWrapper) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress));
+				}
+
+				for (size_t unIndex = 0; unIndex < HOOK_RAW_TRAMPOLINE_SIZE; ++unIndex) {
+					g_Suspender.FixExecutionAddress(reinterpret_cast<unsigned char*>(m_pTrampoline) + unIndex, reinterpret_cast<unsigned char*>(m_pAddress) + unIndex);
+				}
 			}
 
 			Protection HookProtection(m_pAddress, m_unOriginalBytes, false);
-			if (!HookProtection.ChangeProtection(PAGE_READWRITE)) {
+			if (!HookProtection.Change(PAGE_EXECUTE_READWRITE)) {
 				g_Suspender.Resume();
 				return false;
 			}
 
 			memcpy(m_pAddress, m_pOriginalBytes.get(), m_unOriginalBytes);
 
-			HookProtection.RestoreProtection();
+			if (!HookProtection.Restore()) {
+				__debugbreak();
+				g_Suspender.Resume();
+				return false;
+			}
 
 			m_pOriginalBytes = nullptr;
 			m_unOriginalBytes = 0;

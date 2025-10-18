@@ -7,6 +7,7 @@
 #pragma warning(disable : 4201)
 
 // Default
+#define NOMINMAX
 #include <Windows.h>
 #include <TlHelp32.h>
 
@@ -35,22 +36,51 @@
 // ----------------------------------------------------------------
 
 // MSVC - Linker
+
 #define LINKER_OPTION(OPTION) __pragma(comment(linker, OPTION))
 
 // MSVC - Symbols
+
 #define INCLUDE(SYMBOL_NAME) LINKER_OPTION("/INCLUDE:" SYMBOL_NAME)
 #define SELF_INCLUDE INCLUDE(__FUNCDNAME__)
 #define EXPORT(SYMBOL_NAME, ALIAS_NAME) LINKER_OPTION("/EXPORT:" ALIAS_NAME "=" SYMBOL_NAME)
 #define SELF_EXPORT(ALIAS_NAME) EXPORT(__FUNCDNAME__, ALIAS_NAME)
 
 // MSVC - Sections
+
+#define DECLARE_SECTION(NAME) __pragma(section(NAME, execute))
+
 #define SECTION_READONLY "R"
 #define SECTION_READWRITE "RW"
 #define SECTION_EXECUTE_READ "ER"
 #define SECTION_EXECUTE_READWRITE "ERW"
-#define DECLARE_SECTION(NAME) __pragma(section(NAME))
-#define DEFINE_SECTION(NAME, ATTRIBUTES) LINKER_OPTION("/SECTION:" NAME "," ATTRIBUTES)
-#define DEFINE_IN_SECTION(NAME) __declspec(allocate(NAME))
+#define CHANGE_SECTION_ATTRIBUTES(NAME, ATTRIBUTES) LINKER_OPTION("/SECTION:" NAME "," ATTRIBUTES)
+
+#define DEFINE_SECTION(NAME, ATTRIBUTES)   \
+	DECLARE_SECTION(NAME)                  \
+	CHANGE_SECTION_ATTRIBUTES(NAME, ATTRIBUTES)
+
+#define MERGE_SECTION(FROM, TO) LINKER_OPTION("/MERGE:" FROM "=" TO)
+
+#define DEFINE_DATA_IN_SECTION(NAME) __declspec(allocate(NAME))
+#define DEFINE_CODE_IN_SECTION(NAME) __declspec(code_seg(NAME))
+
+// MSVC - Optimization
+
+#define DISABLE_OPTIMIZATION(OPTION) \
+	__pragma(optimize(OPTION, off))
+
+#define ENABLE_OPTIMIZATION(OPTION) \
+	__pragma(optimize(OPTION, on))
+
+#define DISABLE_OPTIMIZATION_BEGIN(OPTION) \
+	DISABLE_OPTIMIZATION(OPTION)           \
+	extern "C++"
+
+#define DISABLE_OPTIMIZATION_END(OPTION) \
+	ENABLE_OPTIMIZATION(OPTION)
+
+// Definitions
 
 #ifndef PROCESSOR_FEATURE_MAX
 #define PROCESSOR_FEATURE_MAX 64
@@ -628,6 +658,10 @@
 #ifndef HOOK_RAW_TRAMPOLINE_SIZE
 #define HOOK_RAW_TRAMPOLINE_SIZE 0x30 // Max trampoline size.
 #endif // !HOOK_RAW_TRAMPOLINE_SIZE
+
+#ifndef CALLSTACK_MAX_ENTRIES
+#define CALLSTACK_MAX_ENTRIES 8 // Max entries for callstack
+#endif // !CALLSTACK_MAX_ENTRIES
 
 // ----------------------------------------------------------------
 // Detours
@@ -1383,31 +1417,38 @@ namespace Detours {
 	} TEB, *PTEB;
 
 	PTEB GetTEB();
+	PTEB GetTEB(HANDLE hThread);
+
+	// ----------------------------------------------------------------
+	// CallStack
+	// ----------------------------------------------------------------
+
+	namespace CallStack {
+
+		// ----------------------------------------------------------------
+		// GetCallStack
+		// ----------------------------------------------------------------
+
+		std::vector<void*> GetCallStack(HANDLE hThread, size_t unMaxEntries = CALLSTACK_MAX_ENTRIES);
+
+		// ----------------------------------------------------------------
+		// GetShadowStack
+		// ----------------------------------------------------------------
+
+		bool GetShadowStack(HANDLE hThread, void*** pShadowStack, size_t* pSize);
+
+		// ----------------------------------------------------------------
+		// GetShadowCallStack
+		// ----------------------------------------------------------------
+
+		std::vector<void*> GetShadowCallStack(HANDLE hThread, size_t unMaxEntries = CALLSTACK_MAX_ENTRIES);
+	}
 
 	// ----------------------------------------------------------------
 	// LDR
 	// ----------------------------------------------------------------
 
 	namespace LDR {
-
-		// ----------------------------------------------------------------
-		// List Entry APIs
-		// ----------------------------------------------------------------
-
-		void InitializeListHead(PLIST_ENTRY pListHead);
-		void InsertHeadList(PLIST_ENTRY pListHead, PLIST_ENTRY pEntry);
-		void InsertTailList(PLIST_ENTRY pListHead, PLIST_ENTRY pEntry);
-		void RemoveEntryList(PLIST_ENTRY pEntry);
-		void RemoveHeadList(PLIST_ENTRY pListHead);
-		void RemoveTailList(PLIST_ENTRY pListHead);
-
-		PLIST_ENTRY GetListHeadFromEntry(PLIST_ENTRY pEntry);
-
-		// ----------------------------------------------------------------
-		// GetHeadsOfLists
-		// ----------------------------------------------------------------
-
-		bool GetHeadsOfLists(PLIST_ENTRY* pInLoadOrderModuleList, PLIST_ENTRY* pInMemoryOrderModuleList, PLIST_ENTRY* pInInitializationOrderModuleList);
 
 		// ----------------------------------------------------------------
 		// FindModuleListEntry
@@ -1442,11 +1483,7 @@ namespace Detours {
 		// ----------------------------------------------------------------
 
 		typedef struct _LINK_DATA {
-			PLIST_ENTRY m_pHeadInLoadOrderLinks;
-			PLIST_ENTRY m_pHeadInMemoryOrderLinks;
-			PLIST_ENTRY m_pHeadInInitializationOrderLinks;
-			PLIST_ENTRY m_pHeadHashLinks;
-			PLIST_ENTRY m_pHeadNodeModuleLink;
+			PLDR_DATA_TABLE_ENTRY m_pDTE;
 			PLIST_ENTRY m_pSavedInLoadOrderLinks;
 			PLIST_ENTRY m_pSavedInMemoryOrderLinks;
 			PLIST_ENTRY m_pSavedInInitializationOrderLinks;
@@ -1458,6 +1495,7 @@ namespace Detours {
 		// UnLinkModule
 		// ----------------------------------------------------------------
 
+		bool UnLinkModule(PLDR_DATA_TABLE_ENTRY pDTE, PLINK_DATA pLinkData);
 		bool UnLinkModule(void* pBaseAddress, PLINK_DATA pLinkData);
 		bool UnLinkModule(HMODULE hModule, PLINK_DATA pLinkData);
 		bool UnLinkModuleA(const char* szModuleName, PLINK_DATA pLinkData);
@@ -1472,7 +1510,7 @@ namespace Detours {
 		// ReLinkModule
 		// ----------------------------------------------------------------
 
-		bool ReLinkModule(LINK_DATA LinkData);
+		void ReLinkModule(LINK_DATA LinkData);
 	}
 
 	// ----------------------------------------------------------------
@@ -1480,6 +1518,18 @@ namespace Detours {
 	// ----------------------------------------------------------------
 
 	namespace Codec {
+
+		// ----------------------------------------------------------------
+		// UpperCase
+		// ----------------------------------------------------------------
+
+		bool UpperCase(char szBuffer[], const size_t unSize);
+
+		// ----------------------------------------------------------------
+		// LowerCase
+		// ----------------------------------------------------------------
+
+		bool LowerCase(char szBuffer[], const size_t unSize);
 
 		// ----------------------------------------------------------------
 		// Encode
@@ -1561,120 +1611,120 @@ namespace Detours {
 		// FindSignature (Native)
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureNative(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNative(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNative(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNative(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNativeA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNativeW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureNative(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNative(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNative(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNative(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNativeA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNativeA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNativeW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNativeW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #ifdef _UNICODE
-		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNative(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNative(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNative(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #else
-		void const* FindSignatureNative(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNative(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureNative(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureNative(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNative(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureNative(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #endif
 
 		// ----------------------------------------------------------------
 		// FindSignature (SSE2)
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureSSE2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureSSE2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #ifdef _UNICODE
-		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #else
-		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureSSE2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #endif
 
 		// ----------------------------------------------------------------
 		// FindSignature (AVX2)
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureAVX2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureAVX2(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #ifdef _UNICODE
-		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #else
-		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX2(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #endif
 
 		// ----------------------------------------------------------------
 		// FindSignature (AVX512) [AVX512BW]
 		// ----------------------------------------------------------------
 
-		void const* FindSignatureAVX512(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureAVX512(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512A(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512A(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512W(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #ifdef _UNICODE
-		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #else
-		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureAVX512(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #endif
 
 		// ----------------------------------------------------------------
 		// FindSignature (Auto)
 		// ----------------------------------------------------------------
 
-		void const* FindSignature(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignature(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignature(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignature(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignature(void const* const pAddress, const size_t unSize, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignature(const HMODULE hModule, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignature(const HMODULE hModule, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignature(const HMODULE hModule, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureA(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureA(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureA(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureW(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignatureW(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #ifdef _UNICODE
-		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignature(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignature(wchar_t const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignature(wchar_t const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #else
-		void const* FindSignature(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignature(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
-		void const* FindSignature(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0, const unsigned int unHash = 0) noexcept;
+		void const* FindSignature(char const* const szModuleName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignature(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
+		void const* FindSignature(char const* const szModuleName, char const* const szSectionName, char const* const szSignature, const unsigned char unIgnoredByte = '\x2A', const size_t unOffset = 0) noexcept;
 #endif
 
 		// ----------------------------------------------------------------
@@ -1874,6 +1924,24 @@ namespace Detours {
 #pragma pack(pop)
 
 		// ----------------------------------------------------------------
+		// RT functions
+		// ----------------------------------------------------------------
+
+#ifdef _M_X64
+		void* const RTDynamicCast(void const* const pBaseAddress, void* const pAddress, const LONG nVfDelta, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor, const BOOL bIsReference);
+#elif _M_IX86
+		void* const RTDynamicCast(void* const pAddress, const LONG nVfDelta, const PRTTI_TYPE_DESCRIPTOR pSourceTypeDescriptor, const PRTTI_TYPE_DESCRIPTOR pTargetTypeDescriptor, const BOOL bIsReference);
+#endif
+
+		void* const RTCastToVoid(void* const pAddress);
+
+#ifdef _M_X64
+		const PRTTI_TYPE_DESCRIPTOR RTtypeid(void const* const pBaseAddress, void* const pAddress);
+#elif _M_IX86
+		const PRTTI_TYPE_DESCRIPTOR RTtypeid(void* const pAddress);
+#endif
+
+		// ----------------------------------------------------------------
 		// Object
 		// ----------------------------------------------------------------
 
@@ -1908,15 +1976,29 @@ namespace Detours {
 		// FindObject
 		// ----------------------------------------------------------------
 
-		std::unique_ptr<Object> FindObject(void const* const pBaseAddress, void const* const pAddress, const size_t unSize, char const* const szName, bool bCompleteObject = true);
-		std::unique_ptr<Object> FindObject(void const* const pAddress, const size_t unSize, char const* const szName, bool bCompleteObject = true);
-		std::unique_ptr<Object> FindObject(const HMODULE hModule, char const* const szName, bool bCompleteObject = true);
-		std::unique_ptr<Object> FindObjectA(char const* const szModuleName, char const* const szName, bool bCompleteObject = true);
-		std::unique_ptr<Object> FindObjectW(wchar_t const* const szModuleName, char const* const szName, bool bCompleteObject = true);
+		std::unique_ptr<Object> FindObject(void const* const pBaseAddress, void const* const pAddress, const size_t unSize, char const* const szName, const char* szParentName = nullptr, bool bCompleteObject = true, unsigned int unOffset = 0);
+		std::unique_ptr<Object> FindObject(void const* const pAddress, const size_t unSize, char const* const szName, const char* szParentName = nullptr, bool bCompleteObject = true, unsigned int unOffset = 0);
+		std::unique_ptr<Object> FindObject(const HMODULE hModule, char const* const szName, const char* szParentName = nullptr, bool bCompleteObject = true, unsigned int unOffset = 0);
+		std::unique_ptr<Object> FindObjectA(char const* const szModuleName, char const* const szName, const char* szParentName = nullptr, bool bCompleteObject = true, unsigned int unOffset = 0);
+		std::unique_ptr<Object> FindObjectW(wchar_t const* const szModuleName, char const* const szName, const char* szParentName = nullptr, bool bCompleteObject = true, unsigned int unOffset = 0);
 #ifdef _UNICODE
-		std::unique_ptr<Object> FindObject(wchar_t const* const szModuleName, char const* const szName, bool bCompleteObject = true);
+		std::unique_ptr<Object> FindObject(wchar_t const* const szModuleName, char const* const szName, const char* szParentName = nullptr, bool bCompleteObject = true, unsigned int unOffset = 0);
 #else
-		std::unique_ptr<Object> FindObject(char const* const szModuleName, char const* const szName, bool bCompleteObject = true);
+		std::unique_ptr<Object> FindObject(char const* const szModuleName, char const* const szName, const char* szParentName = nullptr, bool bCompleteObject = true, unsigned int unOffset = 0);
+#endif
+
+		// ----------------------------------------------------------------
+		// DumpRTTI
+		// ----------------------------------------------------------------
+
+		std::vector<std::unique_ptr<Object>> DumpRTTI(void const* const pBaseAddress, void const* const pAddress, const size_t unSize);
+		std::vector<std::unique_ptr<Object>> DumpRTTI(HMODULE hModule);
+		std::vector<std::unique_ptr<Object>> DumpRTTIA(char const* const szModulePath);
+		std::vector<std::unique_ptr<Object>> DumpRTTIW(wchar_t const* const szModulePath);
+#ifdef _UNICODE
+		std::vector<std::unique_ptr<Object>> DumpRTTI(wchar_t const* const szModulePath);
+#else
+		std::vector<std::unique_ptr<Object>> DumpRTTI(char const* const szModulePath);
 #endif
 	}
 
@@ -2061,7 +2143,6 @@ namespace Detours {
 		private:
 			HANDLE m_hMutex;
 		};
-		
 
 		// ----------------------------------------------------------------
 		// Semaphore
@@ -2131,7 +2212,6 @@ namespace Detours {
 
 		class CriticalSection {
 		public:
-			CriticalSection();
 			CriticalSection(DWORD unSpinCount = 0);
 			~CriticalSection();
 
@@ -2147,50 +2227,6 @@ namespace Detours {
 		};
 
 		// ----------------------------------------------------------------
-		// SRWLock
-		// ----------------------------------------------------------------
-
-		class SRWLock {
-		public:
-			SRWLock(bool bIsShared = false);
-			~SRWLock();
-
-		public:
-			bool IsShared() const;
-			PSRWLOCK GetSRWLock();
-
-		public:
-			void Acquire();
-			void Release();
-
-		private:
-			bool m_bIsShared;
-			SRWLOCK m_SRWLock;
-		};
-
-		// ----------------------------------------------------------------
-		// ConditionVariable
-		// ----------------------------------------------------------------
-
-		class ConditionVariable {
-		public:
-			ConditionVariable();
-			~ConditionVariable();
-
-		public:
-			CONDITION_VARIABLE GetConditionVariable() const;
-
-		public:
-			bool Sleep(CriticalSection* pLock, DWORD unMilliseconds = INFINITE);
-			bool Sleep(SRWLock* pLock, DWORD unMilliseconds = INFINITE);
-			void Wake();
-			void WakeAll();
-
-		private:
-			CONDITION_VARIABLE m_ConditionVariable;
-		};
-
-		// ----------------------------------------------------------------
 		// Suspender
 		// ----------------------------------------------------------------
 
@@ -2202,6 +2238,8 @@ namespace Detours {
 		public:
 			bool Suspend();
 			void Resume();
+			bool IsRegionExecuting(void* pAddress, size_t unSize);
+			bool IsRegionInCallStacks(void* pAddress, size_t unSize);
 			void FixExecutionAddress(void* pAddress, void* pNewAddress);
 
 		private:
@@ -2289,7 +2327,6 @@ namespace Detours {
 
 	namespace Parallel {
 
-		/*
 		// ----------------------------------------------------------------
 		// Thread CallBack
 		// ----------------------------------------------------------------
@@ -2326,7 +2363,6 @@ namespace Detours {
 			void* m_pData;
 			HANDLE m_hThread;
 		};
-		*/
 
 		// ----------------------------------------------------------------
 		// Fiber CallBack
@@ -2429,18 +2465,27 @@ namespace Detours {
 
 		class Page {
 		public:
-			Page(size_t unCapacity = 0);
+			Page(void* pBaseAddress, bool bAutoRestore, bool bCommitPage = false);
+			Page(void* pDesiredAddress = nullptr);
 			~Page();
 
-			void* Alloc(size_t unSize);
+		public:
+			bool GetProtection(const PDWORD pProtection);
+			bool GetOriginalProtection(const PDWORD pProtection);
+			bool ChangeProtection(const DWORD unNewProtection);
+			bool RestoreProtection();
+
+		public:
+			void* Alloc(size_t unSize, size_t unSizeAlign = 1, size_t unAddressAlign = alignof(void*));
+			void* ZeroAlloc(size_t unSize, size_t unSizeAlign = 1, size_t unAddressAlign = alignof(void*));
 			bool DeAlloc(void* pAddress);
 			void DeAllocAll();
 
 		public:
-			void* GetAddress() const;
-			size_t GetCapacity() const;
-			size_t GetSize() const;
-			bool IsEmpty() const;
+			void* GetPageAddress() const;
+			size_t GetPageCapacity() const;
+			size_t GetDataSize() const;
+			bool IsPageEmpty() const;
 
 		private:
 			void MergeFreeBlocks();
@@ -2460,53 +2505,59 @@ namespace Detours {
 				size_t m_unSize;
 			};
 
-			size_t m_unCapacity;
+		private:
+			bool m_bIsManualPage;
+			size_t m_unPageCapacity;
 			void* m_pPageAddress;
+			bool m_bAutoRestore;
+			bool m_bCommitted;
+			DWORD m_unOriginalProtection;
 			std::set<Block> m_FreeBlocks;
 			std::set<Block> m_ActiveBlocks;
 		};
 
 		// ----------------------------------------------------------------
-		// NearPage
+		// Region
 		// ----------------------------------------------------------------
 
-		class NearPage {
+		class Region {
 		public:
-			NearPage(size_t unCapacity = 0, void* pDesiredAddress = nullptr);
-			~NearPage();
+			Region(void* pBaseAddress, bool bAutoRestore);
+			Region(void* pDesiredAddress = nullptr, size_t unCapacity = 0);
+			~Region();
 
-			void* Alloc(size_t unSize);
+		public:
+			bool GetProtection(const PDWORD pProtection);
+			bool GetOriginalProtection(const PDWORD pProtection);
+			bool ChangeProtection(const DWORD unNewProtection);
+			bool RestoreProtection();
+
+		public:
+			bool CloneFrom(Region* pSourceRegion);
+			bool CloneTo(Region* pDestinationRegion);
+			bool CloneFrom(void* pSourceBaseAddress, size_t unSize = 0);
+			bool CloneTo(void* pDestinationBaseAddress, size_t unSize = 0);
+
+		public:
+			void* Alloc(size_t unSize, size_t unSizeAlign = 1, size_t unAddressAlign = alignof(void*), Page** pUsedPage = nullptr);
+			void* ZeroAlloc(size_t unSize, size_t unSizeAlign = 1, size_t unAddressAlign = alignof(void*), Page** pUsedPage = nullptr);
 			bool DeAlloc(void* pAddress);
 			void DeAllocAll();
 
 		public:
-			void* GetAddress() const;
-			size_t GetCapacity() const;
-			size_t GetSize() const;
-			bool IsEmpty() const;
+			void* GetRegionAddress() const;
+			size_t GetRegionCapacity() const;
+			size_t GetDataSize() const;
+			bool IsRegionEmpty() const;
 
 		private:
-			void MergeFreeBlocks();
-
-		private:
-			struct Block {
-				Block(void* pAddress, size_t unSize) {
-					m_pAddress = pAddress;
-					m_unSize = unSize;
-				}
-
-				bool operator<(const Block& block) const {
-					return m_pAddress < block.m_pAddress;
-				};
-
-				void* m_pAddress;
-				size_t m_unSize;
-			};
-
-			size_t m_unCapacity;
-			void* m_pPageAddress;
-			std::set<Block> m_FreeBlocks;
-			std::set<Block> m_ActiveBlocks;
+			bool m_bIsManualRegion;
+			size_t m_unRegionCapacity;
+			void* m_pRegionAddress;
+			bool m_bAutoRestore;
+			DWORD m_unOriginalProtection;
+			size_t m_unUsedSpace;
+			std::list<Page> m_Pages;
 		};
 
 		// ----------------------------------------------------------------
@@ -2515,50 +2566,25 @@ namespace Detours {
 
 		class Storage {
 		public:
-			Storage(size_t unTotalCapacity = 0, size_t unPageCapacity = 0);
+			Storage(size_t unTotalCapacity = 0, size_t unRegionCapacity = 0);
 			~Storage() = default;
 
 		public:
-			void* Alloc(size_t unSize);
+			void* Alloc(size_t unSize, size_t unSizeAlign = 1, size_t unAddressAlign = alignof(void*), void* pDesiredAddress = nullptr, Page** pUsedPage = nullptr, Region** pUsedRegion = nullptr);
+			void* ZeroAlloc(size_t unSize, size_t unSizeAlign = 1, size_t unAddressAlign = alignof(void*), void* pDesiredAddress = nullptr, Page** pUsedPage = nullptr, Region** pUsedRegion = nullptr);
 			bool DeAlloc(void* pAddress);
 			bool DeAllocAll();
 
 		public:
-			size_t GetCapacity() const;
-			size_t GetSize() const;
-			bool IsEmpty() const;
+			size_t GetStorageCapacity() const;
+			size_t GetDataSize() const;
+			bool IsStorageEmpty() const;
 
 		private:
 			size_t m_unTotalCapacity;
-			size_t m_unPageCapacity;
+			size_t m_unRegionCapacity;
 			size_t m_unUsedSpace;
-			std::list<Page> m_Pages;
-		};
-
-		// ----------------------------------------------------------------
-		// NearStorage
-		// ----------------------------------------------------------------
-
-		class NearStorage {
-		public:
-			NearStorage(size_t unTotalCapacity = 0, size_t unPageCapacity = 0);
-			~NearStorage() = default;
-
-		public:
-			void* Alloc(size_t unSize, void* pDesiredAddress = nullptr);
-			bool DeAlloc(void* pAddress);
-			bool DeAllocAll();
-
-		public:
-			size_t GetCapacity() const;
-			size_t GetSize() const;
-			bool IsEmpty() const;
-
-		private:
-			size_t m_unTotalCapacity;
-			size_t m_unPageCapacity;
-			size_t m_unUsedSpace;
-			std::list<NearPage> m_Pages;
+			std::list<Region> m_Regions;
 		};
 
 		// ----------------------------------------------------------------
@@ -2567,25 +2593,50 @@ namespace Detours {
 
 		class Protection {
 		public:
-			Protection(void const* const pAddress, const size_t unSize, const bool bAutoRestore = true);
+			Protection(void* pAddress, size_t unSize, bool bAutoRestore = true);
 			~Protection();
 
 		public:
-			bool GetProtection(const PDWORD pProtection);
-			bool ChangeProtection(const DWORD unNewProtection);
-			bool RestoreProtection();
-
-		public:
-			const void* GetAddress() const;
-			size_t GetSize() const;
-			DWORD GetOriginalProtection() const;
+			bool Change(const DWORD unNewProtection);
+			bool Restore();
 
 		private:
-			void const* const m_pAddress;
-			const size_t m_unSize;
-			const bool m_bAutoRestore;
-			DWORD m_unOriginalProtection;
+			bool m_bAutoRestore;
+			bool m_bUseRegions;
+			std::deque<Page> m_Pages;
+			std::deque<Region> m_Regions;
 		};
+
+		// ----------------------------------------------------------------
+		// MemoryManager
+		// ----------------------------------------------------------------
+
+		class MemoryManager {
+		public:
+			MemoryManager() = default;
+			~MemoryManager() = default;
+
+		public:
+			Page* CreatePage();
+			Storage* CreateStorage(size_t unTotalCapacity = 0, size_t unPageCapacity = 0);
+
+		public:
+			bool DestroyPage(Page* pPage);
+			bool DestroyStorage(Storage* pStorage);
+
+		public:
+			std::unique_ptr<Page> GetPage(void* pAddress);
+			std::unique_ptr<Region> GetRegion(void* pAddress);
+
+		public:
+			std::vector<Page> CollectPages(void* pAddress, size_t unSize);
+			std::vector<Region> CollectRegions(void* pAddress, size_t unSize);
+
+		private:
+			std::deque<std::unique_ptr<Page>> m_Pages;
+			std::deque<std::unique_ptr<Storage>> m_Storages;
+		};
+
 	}
 
 	// ----------------------------------------------------------------
@@ -5541,6 +5592,8 @@ namespace Detours {
 		bool RdIsInstruxRipRelative(PINSTRUCTION pInstruction);
 		unsigned int RdGetFullAccessMap(PINSTRUCTION pInstruction, PRD_ACCESS_MAP pAccessMap);
 		unsigned int RdGetOperandRlut(PINSTRUCTION pInstruction, PRD_OPERARD_RLUT pRlut);
+
+		void* RdGetAddressFromRelOrDisp(void* pAddress);
 	}
 
 	// ----------------------------------------------------------------
@@ -5550,77 +5603,67 @@ namespace Detours {
 	namespace Hook {
 
 		// ----------------------------------------------------------------
+		// Hardware Hook Register
+		// ----------------------------------------------------------------
+
+		typedef enum _HARDWARE_HOOK_REGISTER : unsigned char {
+			REGISTER_DR0 = 0,
+			REGISTER_DR1 = 1,
+			REGISTER_DR2 = 2,
+			REGISTER_DR3 = 3
+		} HARDWARE_HOOK_REGISTER, *PHARDWARE_HOOK_REGISTER;
+
+		// ----------------------------------------------------------------
+		// Hardware Hook Type
+		// ----------------------------------------------------------------
+
+		typedef enum _HARDWARE_HOOK_TYPE : unsigned char {
+			TYPE_EXECUTE = 0,
+			TYPE_WRITE = 1,
+			TYPE_ACCESS = 3
+		} HARDWARE_HOOK_TYPE, *PHARDWARE_HOOK_TYPE;
+
+		// ----------------------------------------------------------------
+		// Hardware Hook CallBack
+		// ----------------------------------------------------------------
+
+		using fnHardwareHookCallBack = void(*)(const PCONTEXT pCTX);
+
+		// ----------------------------------------------------------------
+		// Hardware Hook
+		// ----------------------------------------------------------------
+
+		bool HookHardware(DWORD unThreadID, HARDWARE_HOOK_REGISTER unRegister, const fnHardwareHookCallBack pCallBack, void* pAddress, HARDWARE_HOOK_TYPE unType, unsigned char unSize = 1);
+		bool UnHookHardware(DWORD unThreadID, HARDWARE_HOOK_REGISTER unRegister);
+
+		// ----------------------------------------------------------------
+		// Memory Hook Operation
+		// ----------------------------------------------------------------
+
+		typedef enum _MEMORY_HOOK_OPERATION : unsigned char {
+			MEMORY_READ = 0,
+			MEMORY_WRITE = 1,
+			MEMORY_EXECUTE = 2
+		} MEMORY_HOOK_OPERATION, *PMEMORY_HOOK_OPERATION;
+
+		// ----------------------------------------------------------------
 		// Memory Hook CallBack
 		// ----------------------------------------------------------------
 
-		using fnMemoryHookCallBack = bool(*)(const std::unique_ptr<class MemoryHook>& pHook, const PCONTEXT pCTX);
-
-		// ----------------------------------------------------------------
-		// Memory Hook (Don't use this to define hooks)
-		// ----------------------------------------------------------------
-
-		class MemoryHook {
-		public:
-			MemoryHook(void* pAddress, size_t unSize = 1, bool bAutoDisable = false);
-			~MemoryHook();
-
-		public:
-			bool Hook(const fnMemoryHookCallBack pCallBack);
-			bool UnHook();
-
-		public:
-			bool Enable();
-			bool Disable();
-
-		public:
-			void* GetAddress() const;
-			size_t GetSize() const;
-			bool IsAutoDisable() const;
-			fnMemoryHookCallBack GetCallBack() const;
-
-		private:
-			void* m_pAddress;
-			size_t m_unSize;
-			bool m_bAutoDisable;
-			fnMemoryHookCallBack m_pCallBack;
-		};
+		using fnMemoryHookCallBack = void(*)(const PCONTEXT pCTX, const void* pExceptionAddress, MEMORY_HOOK_OPERATION unOperation, const void* pAddress, const void* pAccessAddress);
 
 		// ----------------------------------------------------------------
 		// Memory Hook
 		// ----------------------------------------------------------------
 
-		bool HookMemory(void* pAddress, const fnMemoryHookCallBack pCallBack, bool bAutoDisable = false);
+		bool HookMemory(const fnMemoryHookCallBack pCallBack, void* pAddress, size_t unSize, const fnMemoryHookCallBack pPostCallBack = nullptr);
 		bool UnHookMemory(const fnMemoryHookCallBack pCallBack);
-		bool EnableHookMemory(const fnMemoryHookCallBack pCallBack);
-		bool DisableHookMemory(const fnMemoryHookCallBack pCallBack);
 
 		// ----------------------------------------------------------------
 		// Interrupt Hook CallBack
 		// ----------------------------------------------------------------
 
-		using fnInterruptHookCallBack = bool(*)(const std::unique_ptr<class InterruptHook>& pHook, const PCONTEXT pCTX);
-
-		// ----------------------------------------------------------------
-		// Interrupt Hook (Don't use this to define hooks)
-		// ----------------------------------------------------------------
-
-		class InterruptHook {
-		public:
-			InterruptHook(unsigned char unInterrupt = 0x7E);
-			~InterruptHook();
-
-		public:
-			bool Hook(const fnInterruptHookCallBack pCallBack);
-			bool UnHook();
-
-		public:
-			unsigned char GetInterrupt() const;
-			fnInterruptHookCallBack GetCallBack() const;
-
-		private:
-			unsigned char m_unInterrupt;
-			fnInterruptHookCallBack m_pCallBack;
-		};
+		using fnInterruptHookCallBack = bool(*)(const PCONTEXT pCTX, const unsigned char unInterrupt);
 
 		// ----------------------------------------------------------------
 		// Interrupt Hook
@@ -5700,8 +5743,8 @@ namespace Detours {
 			bool Release();
 
 		public:
-			bool Hook(void* pHookAddress, bool bSingleInstructionOnly = false);
-			bool UnHook();
+			bool Hook(void* pHookAddress, bool bSingleInstructionOnly = false, bool bWaitForHook = true);
+			bool UnHook(bool bWaitForUnHook = true);
 
 		public:
 			void* GetTrampoline() const;
@@ -5729,8 +5772,8 @@ namespace Detours {
 			bool Release();
 
 		public:
-			bool Hook(void* pHookAddress, bool bSingleInstructionOnly = true);
-			bool UnHook();
+			bool Hook(void* pHookAddress, bool bSingleInstructionOnly = true, bool bWaitForHook = true);
+			bool UnHook(bool bWaitForUnHook = true);
 
 		public:
 			void* GetTrampoline() const;
@@ -5879,30 +5922,30 @@ namespace Detours {
 				unsigned int m_unEFLAGS;
 				unsigned short m_unFLAGS;
 				struct {
-					unsigned int m_unCF : 1;    // Bit 0: Carry Flag
-					unsigned int : 1;           // Bit 1: Reserved
-					unsigned int m_unPF : 1;    // Bit 2: Parity Flag
-					unsigned int : 1;           // Bit 3: Reserved
-					unsigned int m_unAF : 1;    // Bit 4: Auxiliary Carry Flag
-					unsigned int : 1;           // Bit 5: Reserved
-					unsigned int m_unZF : 1;    // Bit 6: Zero Flag
-					unsigned int m_unSF : 1;    // Bit 7: Sign Flag
-					unsigned int m_unTF : 1;    // Bit 8: Trap Flag
-					unsigned int m_unIF : 1;    // Bit 9: Interrupt Enable Flag
-					unsigned int m_unDF : 1;    // Bit 10: Direction Flag
-					unsigned int m_unOF : 1;    // Bit 11: Overflow Flag
-					unsigned int m_unIOPL : 2;  // Bit 12-13: I/O Privilege Level
-					unsigned int m_unNT : 1;    // Bit 14: Nested Task
-					unsigned int m_unMD : 1;    // Bit 15: Mode Flag
-					unsigned int m_unRF : 1;    // Bit 16: Resume Flag
-					unsigned int m_unVM : 1;    // Bit 17: Virtual 8086 Mode Flag
-					unsigned int m_unAC : 1;    // Bit 18: Alignment Check
-					unsigned int m_unVIF : 1;   // Bit 19: Virtual Interrupt Flag
-					unsigned int m_unVIP : 1;   // Bit 20: Virtual Interrupt Pending
-					unsigned int m_unID : 1;    // Bit 21: ID Flag
-					unsigned int : 8;           // Bit 22-29: Reserved
-					unsigned int : 1;           // Bit 30: Reserved
-					unsigned int m_unAI : 1;    // Bit 31: Alignment Indicator
+					unsigned int m_unCF : 1;   // Bit 0: Carry Flag
+					unsigned int : 1;          // Bit 1: Reserved
+					unsigned int m_unPF : 1;   // Bit 2: Parity Flag
+					unsigned int : 1;          // Bit 3: Reserved
+					unsigned int m_unAF : 1;   // Bit 4: Auxiliary Carry Flag
+					unsigned int : 1;          // Bit 5: Reserved
+					unsigned int m_unZF : 1;   // Bit 6: Zero Flag
+					unsigned int m_unSF : 1;   // Bit 7: Sign Flag
+					unsigned int m_unTF : 1;   // Bit 8: Trap Flag
+					unsigned int m_unIF : 1;   // Bit 9: Interrupt Enable Flag
+					unsigned int m_unDF : 1;   // Bit 10: Direction Flag
+					unsigned int m_unOF : 1;   // Bit 11: Overflow Flag
+					unsigned int m_unIOPL : 2; // Bit 12-13: I/O Privilege Level
+					unsigned int m_unNT : 1;   // Bit 14: Nested Task
+					unsigned int m_unMD : 1;   // Bit 15: Mode Flag
+					unsigned int m_unRF : 1;   // Bit 16: Resume Flag
+					unsigned int m_unVM : 1;   // Bit 17: Virtual 8086 Mode Flag
+					unsigned int m_unAC : 1;   // Bit 18: Alignment Check
+					unsigned int m_unVIF : 1;  // Bit 19: Virtual Interrupt Flag
+					unsigned int m_unVIP : 1;  // Bit 20: Virtual Interrupt Pending
+					unsigned int m_unID : 1;   // Bit 21: ID Flag
+					unsigned int : 8;          // Bit 22-29: Reserved
+					unsigned int : 1;          // Bit 30: Reserved
+					unsigned int m_unAI : 1;   // Bit 31: Alignment Indicator
 				};
 			};
 
@@ -6074,31 +6117,31 @@ namespace Detours {
 				unsigned int m_unEFLAGS;
 				unsigned short m_unFLAGS;
 				struct {
-					unsigned int m_unCF : 1;    // Bit 0: Carry Flag
-					unsigned int : 1;           // Bit 1: Reserved
-					unsigned int m_unPF : 1;    // Bit 2: Parity Flag
-					unsigned int : 1;           // Bit 3: Reserved
-					unsigned int m_unAF : 1;    // Bit 4: Auxiliary Carry Flag
-					unsigned int : 1;           // Bit 5: Reserved
-					unsigned int m_unZF : 1;    // Bit 6: Zero Flag
-					unsigned int m_unSF : 1;    // Bit 7: Sign Flag
-					unsigned int m_unTF : 1;    // Bit 8: Trap Flag
-					unsigned int m_unIF : 1;    // Bit 9: Interrupt Enable Flag
-					unsigned int m_unDF : 1;    // Bit 10: Direction Flag
-					unsigned int m_unOF : 1;    // Bit 11: Overflow Flag
-					unsigned int m_unIOPL : 2;  // Bit 12-13: I/O Privilege Level
-					unsigned int m_unNT : 1;    // Bit 14: Nested Task
-					unsigned int m_unMD : 1;    // Bit 15: Mode Flag
-					unsigned int m_unRF : 1;    // Bit 16: Resume Flag
-					unsigned int m_unVM : 1;    // Bit 17: Virtual 8086 Mode Flag
-					unsigned int m_unAC : 1;    // Bit 18: Alignment Check
-					unsigned int m_unVIF : 1;   // Bit 19: Virtual Interrupt Flag
-					unsigned int m_unVIP : 1;   // Bit 20: Virtual Interrupt Pending
-					unsigned int m_unID : 1;    // Bit 21: ID Flag
-					unsigned int : 8;           // Bit 22-29: Reserved
-					unsigned int : 1;           // Bit 30: Reserved
-					unsigned int m_unAI : 1;    // Bit 31: Alignment Indicator
-					unsigned int : 32;          // Bit 32-63: Reserved
+					unsigned int m_unCF : 1;   // Bit 0: Carry Flag
+					unsigned int : 1;          // Bit 1: Reserved
+					unsigned int m_unPF : 1;   // Bit 2: Parity Flag
+					unsigned int : 1;          // Bit 3: Reserved
+					unsigned int m_unAF : 1;   // Bit 4: Auxiliary Carry Flag
+					unsigned int : 1;          // Bit 5: Reserved
+					unsigned int m_unZF : 1;   // Bit 6: Zero Flag
+					unsigned int m_unSF : 1;   // Bit 7: Sign Flag
+					unsigned int m_unTF : 1;   // Bit 8: Trap Flag
+					unsigned int m_unIF : 1;   // Bit 9: Interrupt Enable Flag
+					unsigned int m_unDF : 1;   // Bit 10: Direction Flag
+					unsigned int m_unOF : 1;   // Bit 11: Overflow Flag
+					unsigned int m_unIOPL : 2; // Bit 12-13: I/O Privilege Level
+					unsigned int m_unNT : 1;   // Bit 14: Nested Task
+					unsigned int m_unMD : 1;   // Bit 15: Mode Flag
+					unsigned int m_unRF : 1;   // Bit 16: Resume Flag
+					unsigned int m_unVM : 1;   // Bit 17: Virtual 8086 Mode Flag
+					unsigned int m_unAC : 1;   // Bit 18: Alignment Check
+					unsigned int m_unVIF : 1;  // Bit 19: Virtual Interrupt Flag
+					unsigned int m_unVIP : 1;  // Bit 20: Virtual Interrupt Pending
+					unsigned int m_unID : 1;   // Bit 21: ID Flag
+					unsigned int : 8;          // Bit 22-29: Reserved
+					unsigned int : 1;          // Bit 30: Reserved
+					unsigned int m_unAI : 1;   // Bit 31: Alignment Indicator
+					unsigned int : 32;         // Bit 32-63: Reserved
 				};
 			};
 
@@ -6510,8 +6553,8 @@ namespace Detours {
 			bool Release();
 
 		public:
-			bool Hook(const fnRawHookCallBack pCallBack, bool bNative = false, const unsigned int unReserveStackSize = 0, bool bSingleInstructionOnly = false);
-			bool UnHook();
+			bool Hook(const fnRawHookCallBack pCallBack, bool bNative = false, const unsigned int unReserveStackSize = 0, bool bSingleInstructionOnly = false, bool bWaitForHook = true);
+			bool UnHook(bool bWaitForUnHook = true);
 
 		public:
 			void* GetTrampoline() const;
