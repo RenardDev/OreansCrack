@@ -3083,7 +3083,7 @@ int _tmain(int argc, PTCHAR argv[], PTCHAR envp[]) {
 			CommandLine += argv[i];
 		}
 
-		if (i + 1 < argc) {
+		if ((i + 1) < argc) {
 			CommandLine += _T(' ');
 		}
 	}
@@ -3258,5 +3258,5 @@ int _tmain(int argc, PTCHAR argv[], PTCHAR envp[]) {
 		return EXIT_FAILURE;
 	}
 
-	return unExitCode;
+	return static_cast<int>(unExitCode);
 }
