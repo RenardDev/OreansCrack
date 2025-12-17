@@ -30,6 +30,7 @@
 #include <mutex>
 #include <vector>
 #include <memory>
+#include <unordered_set>
 
 // ----------------------------------------------------------------
 // General definitions
@@ -56,8 +57,8 @@
 #define SECTION_EXECUTE_READWRITE "ERW"
 #define CHANGE_SECTION_ATTRIBUTES(NAME, ATTRIBUTES) LINKER_OPTION("/SECTION:" NAME "," ATTRIBUTES)
 
-#define DEFINE_SECTION(NAME, ATTRIBUTES)   \
-	DECLARE_SECTION(NAME)                  \
+#define DEFINE_SECTION(NAME, ATTRIBUTES) \
+	DECLARE_SECTION(NAME)                \
 	CHANGE_SECTION_ATTRIBUTES(NAME, ATTRIBUTES)
 
 #define MERGE_SECTION(FROM, TO) LINKER_OPTION("/MERGE:" FROM "=" TO)
@@ -574,9 +575,15 @@
 #define RD_SIGN_EX_8(X) (((X) & 0x00000080) ? (0xFFFFFFFFFFFFFF00 | (X)) : ((X) & 0xFF))
 #define RD_SIGN_EX_16(X) (((X) & 0x00008000) ? (0xFFFFFFFFFFFF0000 | (X)) : ((X) & 0xFFFF))
 #define RD_SIGN_EX_32(X) (((X) & 0x80000000) ? (0xFFFFFFFF00000000 | (X)) : ((X) & 0xFFFFFFFF))
-#define RD_SIGN_EX(S, X) ((S) == 1 ? RD_SIGN_EX_8(X) : (S) == 2 ? RD_SIGN_EX_16(X) : (S) == 4 ? RD_SIGN_EX_32(X) : (X))
-#define RD_TRIM(S, X) ((S) == 1 ? (X) & 0xFF : (S) == 2 ? (X) & 0xFFFF : (S) == 4 ? (X) & 0xFFFFFFFF : (X))
-#define RD_MSB(S, X) ((S) == 1 ? ((X) >> 7) & 1 : (S) == 2 ? ((X) >> 15) & 1 : (S) == 4 ? ((X) >> 31) & 1 : ((X) >> 63) & 1)
+#define RD_SIGN_EX(S, X) ((S) == 1 ? RD_SIGN_EX_8(X) : (S) == 2 ? RD_SIGN_EX_16(X) \
+	                                               : (S) == 4   ? RD_SIGN_EX_32(X) \
+	                                                            : (X))
+#define RD_TRIM(S, X) ((S) == 1 ? (X) & 0xFF : (S) == 2 ? (X) & 0xFFFF     \
+	                                       : (S) == 4   ? (X) & 0xFFFFFFFF \
+	                                                    : (X))
+#define RD_MSB(S, X) ((S) == 1 ? ((X) >> 7) & 1 : (S) == 2 ? ((X) >> 15) & 1 \
+	                                          : (S) == 4   ? ((X) >> 31) & 1 \
+	                                                       : ((X) >> 63) & 1)
 #define RD_LSB(S, X) ((X) & 1)
 #define RD_SIZE_TO_MASK(S) (((S) < 8) ? ((1ULL << ((S) * 8)) - 1) : (0xFFFFFFFFFFFFFFFF))
 #define RD_GET_BIT(BIT, X) (((X) >> (BIT)) & 1)
@@ -632,35 +639,43 @@
 
 // Hook
 #ifndef HOOK_STORAGE_CAPACITY
-#define HOOK_STORAGE_CAPACITY 0x800000 // 8 MiB - Max memory usage for hooks.
+// 8 MiB - Max memory usage for hooks.
+#define HOOK_STORAGE_CAPACITY 0x800000
 #endif // !HOOK_STORAGE_CAPACITY
 
 #ifndef HOOK_INLINE_TRAMPOLINE_SIZE
-#define HOOK_INLINE_TRAMPOLINE_SIZE 0x30 // Max trampoline size.
+// Max trampoline size.
+#define HOOK_INLINE_TRAMPOLINE_SIZE 0x30
 #endif // !HOOK_INLINE_TRAMPOLINE_SIZE
 
 #ifndef HOOK_INLINE_WRAPPER_SIZE
 #ifdef _M_X64
-#define HOOK_INLINE_WRAPPER_SIZE 0x18 // Max wrapper size.
+// Max wrapper size.
+#define HOOK_INLINE_WRAPPER_SIZE 0x18
 #elif _M_IX86
-#define HOOK_INLINE_WRAPPER_SIZE 0x18 // Max wrapper size.
+// Max wrapper size.
+#define HOOK_INLINE_WRAPPER_SIZE 0x18
 #endif
 #endif // !HOOK_INLINE_WRAPPER_SIZE
 
 #ifndef HOOK_RAW_WRAPPER_SIZE
 #ifdef _M_X64
-#define HOOK_RAW_WRAPPER_SIZE 0x500 // Max wrapper size.
+// Max wrapper size.
+#define HOOK_RAW_WRAPPER_SIZE 0x500
 #elif _M_IX86
-#define HOOK_RAW_WRAPPER_SIZE 0x300 // Max wrapper size.
+// Max wrapper size.
+#define HOOK_RAW_WRAPPER_SIZE 0x300
 #endif
 #endif // !HOOK_RAW_WRAPPER_SIZE
 
 #ifndef HOOK_RAW_TRAMPOLINE_SIZE
-#define HOOK_RAW_TRAMPOLINE_SIZE 0x30 // Max trampoline size.
+// Max trampoline size.
+#define HOOK_RAW_TRAMPOLINE_SIZE 0x30
 #endif // !HOOK_RAW_TRAMPOLINE_SIZE
 
 #ifndef CALLSTACK_MAX_ENTRIES
-#define CALLSTACK_MAX_ENTRIES 8 // Max entries for callstack
+// Max entries for callstack
+#define CALLSTACK_MAX_ENTRIES 8
 #endif // !CALLSTACK_MAX_ENTRIES
 
 // ----------------------------------------------------------------
@@ -725,8 +740,10 @@ namespace Detours {
 		LARGE_INTEGER SystemExpirationDate;
 		ULONG SuiteMask;
 		BOOLEAN KdDebuggerEnabled;
+
 		union {
 			UCHAR MitigationPolicies;
+
 			struct {
 				UCHAR NXSupportPolicy : 2;
 				UCHAR SEHValidationPolicy : 2;
@@ -734,6 +751,7 @@ namespace Detours {
 				UCHAR Reserved : 2;
 			};
 		};
+
 		USHORT CyclesPerYield;
 		volatile ULONG ActiveConsoleId;
 		volatile ULONG DismountCount;
@@ -743,8 +761,10 @@ namespace Detours {
 		BOOLEAN SafeBootMode;
 		UCHAR VirtualizationFlags;
 		UCHAR Reserved12[2];
+
 		union {
 			ULONG SharedDataFlags;
+
 			struct {
 				ULONG DbgErrorPortPresent : 1;
 				ULONG DbgElevationEnabled : 1;
@@ -760,20 +780,24 @@ namespace Detours {
 				ULONG SpareBits : 21;
 			};
 		};
+
 		ULONG DataFlagsPad[1];
 		ULONGLONG TestRetInstruction;
 		LONGLONG QpcFrequency;
 		ULONG SystemCall;
 		ULONG Reserved2;
 		ULONGLONG SystemCallPad[2];
+
 		union {
 			volatile KSYSTEM_TIME TickCount;
 			volatile ULONG64 TickCountQuad;
+
 			struct {
 				ULONG ReservedTickCountOverlay[3];
 				ULONG TickCountPad[1];
 			};
 		};
+
 		ULONG Cookie;
 		ULONG CookiePad[1];
 		LONGLONG ConsoleSessionForegroundProcessId;
@@ -796,13 +820,16 @@ namespace Detours {
 		ULONG ActiveProcessorCount;
 		volatile UCHAR ActiveGroupCount;
 		UCHAR Reserved9;
+
 		union {
 			USHORT QpcData;
+
 			struct {
 				volatile UCHAR QpcBypassEnabled;
 				UCHAR QpcShift;
 			};
 		};
+
 		LARGE_INTEGER TimeZoneBiasEffectiveStart;
 		LARGE_INTEGER TimeZoneBiasEffectiveEnd;
 		XSTATE_CONFIGURATION XState;
@@ -875,10 +902,12 @@ namespace Detours {
 		ULONG LoadCount;
 		ULONG LoadWhileUnloadingCount;
 		ULONG LowestLink;
+
 		union {
 			LDRP_CSLIST Dependencies;
 			SINGLE_LIST_ENTRY RemovalLink;
 		};
+
 		LDRP_CSLIST IncomingDependencies;
 		LDR_DDAG_STATE State;
 		SINGLE_LIST_ENTRY CondenseLink;
@@ -888,11 +917,13 @@ namespace Detours {
 	typedef struct _RTL_BALANCED_NODE {
 		union {
 			struct _RTL_BALANCED_NODE* Children[2];
+
 			struct {
 				struct _RTL_BALANCED_NODE* Left;
 				struct _RTL_BALANCED_NODE* Right;
 			};
 		};
+
 		union {
 			UCHAR Red : 1;
 			UCHAR Balance : 2;
@@ -914,18 +945,22 @@ namespace Detours {
 	typedef struct _LDR_DATA_TABLE_ENTRY {
 		LIST_ENTRY InLoadOrderLinks;
 		LIST_ENTRY InMemoryOrderLinks;
+
 		union {
 			LIST_ENTRY InInitializationOrderLinks;
 			LIST_ENTRY InProgressLinks;
 		};
+
 		PVOID DllBase;
 		PLDR_INIT_ROUTINE EntryPoint;
 		ULONG SizeOfImage;
 		UNICODE_STRING FullDllName;
 		UNICODE_STRING BaseDllName;
+
 		union {
 			UCHAR FlagGroup[4];
 			ULONG Flags;
+
 			struct {
 				ULONG PackagedBinary : 1;
 				ULONG MarkedForRemoval : 1;
@@ -958,6 +993,7 @@ namespace Detours {
 				ULONG CompatDatabaseProcessed : 1;
 			};
 		};
+
 		USHORT ObsoleteLoadCount;
 		USHORT TlsIndex;
 		LIST_ENTRY HashLinks;
@@ -1077,8 +1113,10 @@ namespace Detours {
 		BOOLEAN InheritedAddressSpace;
 		BOOLEAN ReadImageFileExecOptions;
 		BOOLEAN BeingDebugged;
+
 		union {
 			BOOLEAN BitField;
+
 			struct {
 				BOOLEAN ImageUsesLargePages : 1;
 				BOOLEAN IsProtectedProcess : 1;
@@ -1090,6 +1128,7 @@ namespace Detours {
 				BOOLEAN IsLongPathAwareProcess : 1;
 			};
 		};
+
 		HANDLE Mutant;
 		PVOID ImageBaseAddress;
 		PPEB_LDR_DATA Ldr;
@@ -1099,8 +1138,10 @@ namespace Detours {
 		PRTL_CRITICAL_SECTION FastPebLock;
 		PSLIST_HEADER AtlThunkSListPtr;
 		PVOID IFEOKey;
+
 		union {
 			ULONG CrossProcessFlags;
+
 			struct {
 				ULONG ProcessInJob : 1;
 				ULONG ProcessInitializing : 1;
@@ -1113,10 +1154,12 @@ namespace Detours {
 				ULONG ReservedBits0 : 24;
 			};
 		};
+
 		union {
 			PVOID KernelCallbackTable;
 			PVOID UserSharedInfoPtr;
 		};
+
 		ULONG SystemReserved;
 		ULONG AtlThunkSListPtr32;
 		PAPI_SET_NAMESPACE ApiSetMap;
@@ -1178,14 +1221,18 @@ namespace Detours {
 		USHORT UnusedNlsField;
 		PVOID WerRegistrationData;
 		PVOID WerShipAssertPtr;
+
 		union {
 			PVOID pContextData;
 			PVOID pUnused;
 			PVOID EcCodeBitMap;
 		};
+
 		PVOID pImageHeaderHash;
+
 		union {
 			ULONG TracingFlags;
+
 			struct {
 				ULONG HeapTracingEnabled : 1;
 				ULONG CritSecTracingEnabled : 1;
@@ -1193,6 +1240,7 @@ namespace Detours {
 				ULONG SpareTracingBits : 29;
 			};
 		};
+
 		ULONGLONG CsrServerReadOnlySharedMemoryBase;
 		RTL_SRWLOCK TppWorkerpListLock;
 		LIST_ENTRY TppWorkerpList;
@@ -1203,13 +1251,16 @@ namespace Detours {
 		CHAR PlaceholderCompatibilityMode;
 		CHAR PlaceholderCompatibilityModeReserved[7];
 		struct _LEAP_SECOND_DATA* LeapSecondData;
+
 		union {
 			ULONG LeapSecondFlags;
+
 			struct {
 				ULONG SixtySecondEnabled : 1;
 				ULONG Reserved : 31;
 			};
 		};
+
 		ULONG NtGlobalFlag2;
 		ULONGLONG ExtendedFeatureDisableMask;
 	} PEB, *PPEB;
@@ -1343,9 +1394,11 @@ namespace Detours {
 		PVOID EtwTraceData;
 		PVOID WinSockData;
 		ULONG GdiBatchCount;
+
 		union {
 			PROCESSOR_NUMBER CurrentIdealProcessor;
 			ULONG IdealProcessorValue;
+
 			struct {
 				UCHAR ReservedPad0;
 				UCHAR ReservedPad1;
@@ -1353,6 +1406,7 @@ namespace Detours {
 				UCHAR IdealProcessor;
 			};
 		};
+
 		ULONG GuaranteedStackBytes;
 		PVOID ReservedForPerf;
 		PVOID ReservedForOle;
@@ -1377,12 +1431,15 @@ namespace Detours {
 		PVOID UserPrefLanguages;
 		PVOID MergedPrefLanguages;
 		ULONG MuiImpersonation;
+
 		union {
 			USHORT CrossTebFlags;
 			USHORT SpareCrossTebBits : 16;
 		};
+
 		union {
 			USHORT SameTebFlags;
+
 			struct {
 				USHORT SafeThunkCall : 1;
 				USHORT InDebugPrint : 1;
@@ -1402,6 +1459,7 @@ namespace Detours {
 				USHORT SkipFileAPIBrokering : 1;
 			};
 		};
+
 		PVOID TxnScopeEnterCallback;
 		PVOID TxnScopeExitCallback;
 		PVOID TxnScopeContext;
@@ -1442,7 +1500,7 @@ namespace Detours {
 		// ----------------------------------------------------------------
 
 		std::vector<void*> GetShadowCallStack(HANDLE hThread, size_t unMaxEntries = CALLSTACK_MAX_ENTRIES);
-	}
+	} // namespace CallStack
 
 	// ----------------------------------------------------------------
 	// LDR
@@ -1511,7 +1569,7 @@ namespace Detours {
 		// ----------------------------------------------------------------
 
 		void ReLinkModule(LINK_DATA LinkData);
-	}
+	} // namespace LDR
 
 	// ----------------------------------------------------------------
 	// Codec
@@ -1542,7 +1600,7 @@ namespace Detours {
 		// ----------------------------------------------------------------
 
 		int Decode(unsigned short unCodePage, wchar_t const* const szText, char* szBuffer = nullptr, const int nBufferSize = 0);
-	}
+	} // namespace Codec
 
 	// ----------------------------------------------------------------
 	// Hexadecimal
@@ -1573,7 +1631,7 @@ namespace Detours {
 #else
 		bool Decode(char const* const szHex, void* pData, const unsigned char unIgnoredByte = 0x2A);
 #endif
-	}
+	} // namespace Hexadecimal
 
 	// ----------------------------------------------------------------
 	// Scan
@@ -1846,7 +1904,7 @@ namespace Detours {
 		void const* FindData(char const* const szModuleName, const std::array<const unsigned char, 8>& SectionName, unsigned char const* const pData, const size_t unDataSize) noexcept;
 		void const* FindData(char const* const szModuleName, char const* const szSectionName, unsigned char const* const pData, const size_t unDataSize) noexcept;
 #endif
-	}
+	} // namespace Scan
 
 	// ----------------------------------------------------------------
 	// Run-Time Type Information (RTTI)
@@ -2000,7 +2058,7 @@ namespace Detours {
 #else
 		std::vector<std::unique_ptr<Object>> DumpRTTI(char const* const szModulePath);
 #endif
-	}
+	} // namespace RTTI
 
 	// ----------------------------------------------------------------
 	// Sync
@@ -2236,7 +2294,7 @@ namespace Detours {
 			~Suspender();
 
 		public:
-			bool Suspend();
+			bool Suspend(bool bSweepThreads = true);
 			void Resume();
 			bool IsRegionExecuting(void* pAddress, size_t unSize);
 			bool IsRegionInCallStacks(void* pAddress, size_t unSize);
@@ -2257,10 +2315,14 @@ namespace Detours {
 
 			std::deque<SUSPENDER_DATA> m_Threads;
 			Mutex m_Mutex;
+			size_t m_unSuspendDepth;
+			std::unordered_set<DWORD> m_SuspendedTIDs;
+
+			size_t SuspendNewThreadsSnapshot();
 		};
 
 		extern Suspender g_Suspender;
-	}
+	} // namespace Sync
 
 	// ----------------------------------------------------------------
 	// Pipe
@@ -2319,7 +2381,7 @@ namespace Detours {
 			size_t m_unBufferSize;
 			HANDLE m_hPipe;
 		};
-	}
+	} // namespace Pipe
 
 	// ----------------------------------------------------------------
 	// Parallel
@@ -2331,7 +2393,7 @@ namespace Detours {
 		// Thread CallBack
 		// ----------------------------------------------------------------
 
-		using fnThreadCallBack = void(*)(void* pData);
+		using fnThreadCallBack = void (*)(void* pData);
 
 		// ----------------------------------------------------------------
 		// Thread
@@ -2368,7 +2430,7 @@ namespace Detours {
 		// Fiber CallBack
 		// ----------------------------------------------------------------
 
-		using fnFiberCallBack = void(*)(void* pData);
+		using fnFiberCallBack = void (*)(void* pData);
 
 		// ----------------------------------------------------------------
 		// Fiber
@@ -2395,7 +2457,7 @@ namespace Detours {
 			fnFiberCallBack m_pCallBack;
 			void* m_pData;
 		};
-	};
+	} // namespace Parallel
 
 	// ----------------------------------------------------------------
 	// Memory
@@ -2636,8 +2698,7 @@ namespace Detours {
 			std::deque<std::unique_ptr<Page>> m_Pages;
 			std::deque<std::unique_ptr<Storage>> m_Storages;
 		};
-
-	}
+	} // namespace Memory
 
 	// ----------------------------------------------------------------
 	// Exception
@@ -2649,7 +2710,7 @@ namespace Detours {
 		// Exception CallBack
 		// ----------------------------------------------------------------
 
-		using fnExceptionCallBack = bool(*)(const EXCEPTION_RECORD& Exception, const PCONTEXT pCTX);
+		using fnExceptionCallBack = bool (*)(const EXCEPTION_RECORD& Exception, const PCONTEXT pCTX);
 
 		// ----------------------------------------------------------------
 		// Exception Listener
@@ -2676,7 +2737,7 @@ namespace Detours {
 		};
 
 		extern ExceptionListener g_ExceptionListener;
-	}
+	} // namespace Exception
 
 	// ----------------------------------------------------------------
 	// rddisasm
@@ -5048,6 +5109,7 @@ namespace Detours {
 
 		typedef union _RD_REX {
 			unsigned char Rex;
+
 			struct {
 				unsigned char b : 1;
 				unsigned char x : 1;
@@ -5058,6 +5120,7 @@ namespace Detours {
 
 		typedef union _RD_MODRM {
 			unsigned char ModRm;
+
 			struct {
 				unsigned char rm : 3;
 				unsigned char reg : 3;
@@ -5067,6 +5130,7 @@ namespace Detours {
 
 		typedef union _RD_SIB {
 			unsigned char Sib;
+
 			struct {
 				unsigned char base : 3;
 				unsigned char index : 3;
@@ -5076,6 +5140,7 @@ namespace Detours {
 
 		typedef union _RD_DREX {
 			unsigned char Drex;
+
 			struct {
 				unsigned char b : 1;
 				unsigned char x : 1;
@@ -5088,6 +5153,7 @@ namespace Detours {
 
 		typedef union _RD_VEX2 {
 			unsigned char Vex[2];
+
 			struct {
 				unsigned char op;
 				unsigned char p : 2;
@@ -5099,6 +5165,7 @@ namespace Detours {
 
 		typedef union _RD_VEX3 {
 			unsigned char Vex[3];
+
 			struct {
 				unsigned char op;
 				unsigned char m : 5;
@@ -5114,6 +5181,7 @@ namespace Detours {
 
 		typedef union _RD_XOP {
 			unsigned char Xop[3];
+
 			struct {
 				unsigned char op;
 				unsigned char m : 5;
@@ -5129,6 +5197,7 @@ namespace Detours {
 
 		typedef union _RD_EVEX {
 			unsigned char Evex[4];
+
 			struct {
 				unsigned char op;
 				unsigned char m : 3;
@@ -5151,6 +5220,7 @@ namespace Detours {
 
 		typedef union _RD_OPERARD_ACCESS {
 			unsigned char Access;
+
 			struct {
 				unsigned char Read : 1;
 				unsigned char Write : 1;
@@ -5162,6 +5232,7 @@ namespace Detours {
 
 		typedef union _RD_OPERARD_FLAGS {
 			unsigned char Flags;
+
 			struct {
 				unsigned char IsDefault : 1;
 				unsigned char SignExtendedOp1 : 1;
@@ -5217,11 +5288,13 @@ namespace Detours {
 			unsigned char DispSize;
 			unsigned char CompDispSize;
 			unsigned char ShStkType;
+
 			struct {
 				unsigned char IndexSize;
 				unsigned char ElemSize;
 				unsigned char ElemCount;
 			} VSib;
+
 			unsigned char Seg;
 			unsigned char Base;
 			unsigned char Index;
@@ -5235,9 +5308,11 @@ namespace Detours {
 			bool HasBroadcast : 1;
 			bool HasSae : 1;
 			bool HasEr : 1;
+
 			struct {
 				unsigned char Msk;
 			} Mask;
+
 			struct {
 				unsigned char Count;
 				unsigned char Size;
@@ -5251,6 +5326,7 @@ namespace Detours {
 			unsigned int RawSize;
 			RD_OPERARD_ACCESS Access;
 			RD_OPERARD_FLAGS Flags;
+
 			union {
 				RD_OPDESC_CONSTANT Constant;
 				RD_OPDESC_IMMEDIATE Immediate;
@@ -5259,6 +5335,7 @@ namespace Detours {
 				RD_OPDESC_ADDRESS Address;
 				RD_OPDESC_MEMORY Memory;
 			} Info;
+
 			RD_OPERARD_DECORATOR Decorator;
 		} RD_OPERAND, *PRD_OPERAND;
 
@@ -5271,6 +5348,7 @@ namespace Detours {
 
 		typedef union _RD_RFLAGS {
 			unsigned int Raw;
+
 			struct {
 				unsigned int CF : 1;
 				unsigned int Reserved1 : 1;
@@ -5305,6 +5383,7 @@ namespace Detours {
 
 		typedef union _RD_CPUID_FLAG {
 			unsigned long long Flag;
+
 			struct {
 				unsigned int Leaf;
 				unsigned int SubLeaf : 24;
@@ -5315,6 +5394,7 @@ namespace Detours {
 
 		typedef union _RD_VALID_MODES {
 			unsigned int Raw;
+
 			struct {
 				unsigned int Ring0 : 1;
 				unsigned int Ring1 : 1;
@@ -5342,6 +5422,7 @@ namespace Detours {
 
 		typedef union _RD_VALID_PREFIXES {
 			unsigned short Raw;
+
 			struct {
 				unsigned short Rep : 1;
 				unsigned short RepCond : 1;
@@ -5358,10 +5439,10 @@ namespace Detours {
 
 		typedef union _RD_VALID_DECORATORS {
 			unsigned char Raw;
+
 			struct {
 				unsigned char Er : 1;
-				unsigned char
-					Sae : 1;
+				unsigned char Sae : 1;
 				unsigned char Zero : 1;
 				unsigned char Mask : 1;
 				unsigned char Broadcast : 1;
@@ -5449,12 +5530,14 @@ namespace Detours {
 			RD_MODRM ModRm;
 			RD_SIB Sib;
 			RD_DREX Drex;
+
 			union {
 				RD_VEX2 Vex2;
 				RD_VEX3 Vex3;
 				RD_XOP Xop;
 				RD_EVEX Evex;
 			};
+
 			struct {
 				unsigned int w : 1;
 				unsigned int r : 1;
@@ -5472,12 +5555,14 @@ namespace Detours {
 				unsigned int k : 3;
 				unsigned int s : 3;
 			} Exs;
+
 			union {
 				struct {
 					unsigned int Ip;
 					unsigned short Cs;
 				};
 			} Address;
+
 			unsigned long long Moffset;
 			unsigned int Displacement;
 			unsigned int RelativeOffset;
@@ -5497,6 +5582,7 @@ namespace Detours {
 			unsigned char StackAccess;
 			unsigned char MemoryAccess;
 			RD_BRANCH_INFO BranchInfo;
+
 			struct {
 				unsigned char RegAccess;
 				RD_RFLAGS Tested;
@@ -5505,16 +5591,19 @@ namespace Detours {
 				RD_RFLAGS Cleared;
 				RD_RFLAGS Undefined;
 			} FlagsAccess;
+
 			RD_FPU_FLAGS FpuFlagsAccess;
 			unsigned char ExceptionClass;
 			unsigned char ExceptionType;
 			unsigned char TupleType;
 			unsigned char RoundingMode;
 			unsigned int Attributes;
+
 			union {
 				RD_INS_CLASS Instruction;
 				RD_INS_CLASS Iclass;
 			};
+
 			RD_INS_CATEGORY Category;
 			RD_INS_SET IsaSet;
 			RD_CPUID_FLAG CpuidFlag;
@@ -5594,7 +5683,7 @@ namespace Detours {
 		unsigned int RdGetOperandRlut(PINSTRUCTION pInstruction, PRD_OPERARD_RLUT pRlut);
 
 		void* RdGetAddressFromRelOrDisp(void* pAddress);
-	}
+	} // namespace rddisasm
 
 	// ----------------------------------------------------------------
 	// Hook
@@ -5627,7 +5716,7 @@ namespace Detours {
 		// Hardware Hook CallBack
 		// ----------------------------------------------------------------
 
-		using fnHardwareHookCallBack = void(*)(const PCONTEXT pCTX);
+		using fnHardwareHookCallBack = void (*)(const PCONTEXT pCTX);
 
 		// ----------------------------------------------------------------
 		// Hardware Hook
@@ -5650,20 +5739,20 @@ namespace Detours {
 		// Memory Hook CallBack
 		// ----------------------------------------------------------------
 
-		using fnMemoryHookCallBack = void(*)(const PCONTEXT pCTX, const void* pExceptionAddress, MEMORY_HOOK_OPERATION unOperation, const void* pAddress, const void* pAccessAddress);
+		using fnMemoryHookCallBack = void (*)(const PCONTEXT pCTX, const void* pExceptionAddress, MEMORY_HOOK_OPERATION unOperation, const void* pAddress, const void* pAccessAddress);
 
 		// ----------------------------------------------------------------
 		// Memory Hook
 		// ----------------------------------------------------------------
 
-		bool HookMemory(const fnMemoryHookCallBack pCallBack, void* pAddress, size_t unSize, const fnMemoryHookCallBack pPostCallBack = nullptr);
-		bool UnHookMemory(const fnMemoryHookCallBack pCallBack);
+		bool HookMemory(const fnMemoryHookCallBack pCallBack, void* pAddress, size_t unSize, const fnMemoryHookCallBack pPostCallBack = nullptr, bool bAllowVirtual = false);
+		bool UnHookMemory(const fnMemoryHookCallBack pCallBack, void* pAddress);
 
 		// ----------------------------------------------------------------
 		// Interrupt Hook CallBack
 		// ----------------------------------------------------------------
 
-		using fnInterruptHookCallBack = bool(*)(const PCONTEXT pCTX, const unsigned char unInterrupt);
+		using fnInterruptHookCallBack = bool (*)(const PCONTEXT pCTX, const unsigned char unInterrupt);
 
 		// ----------------------------------------------------------------
 		// Interrupt Hook
@@ -5824,6 +5913,7 @@ namespace Detours {
 		typedef struct _RAW_CONTEXT_FPU {
 			union {
 				unsigned short m_unControlWord;
+
 				struct {
 					unsigned int m_unInvalidOperation : 1;
 					unsigned int m_unDenormalizedOperand : 1;
@@ -5840,9 +5930,12 @@ namespace Detours {
 					unsigned int m_unInfinityControl : 1;
 				} ControlWord;
 			};
+
 			unsigned short m_unReserved1;
+
 			union {
 				unsigned short m_unStatusWord;
+
 				struct {
 					unsigned int m_unInvalidOperation : 1;
 					unsigned int m_unDenormalizedOperand : 1;
@@ -5859,6 +5952,7 @@ namespace Detours {
 					unsigned int m_unFPUBusy : 1;
 				} StatusWord;
 			};
+
 			unsigned short m_unReserved2;
 			unsigned short m_unTagWord;
 			unsigned short m_unReserved3;
@@ -5921,6 +6015,7 @@ namespace Detours {
 			union {
 				unsigned int m_unEFLAGS;
 				unsigned short m_unFLAGS;
+
 				struct {
 					unsigned int m_unCF : 1;   // Bit 0: Carry Flag
 					unsigned int : 1;          // Bit 1: Reserved
@@ -5957,6 +6052,7 @@ namespace Detours {
 			union {
 				unsigned int m_unEAX;
 				unsigned short m_unAX;
+
 				struct {
 					unsigned char m_unAL;
 					unsigned char m_unAH;
@@ -5967,6 +6063,7 @@ namespace Detours {
 			union {
 				unsigned int m_unECX;
 				unsigned short m_unCX;
+
 				struct {
 					unsigned char m_unCL;
 					unsigned char m_unCH;
@@ -5977,6 +6074,7 @@ namespace Detours {
 			union {
 				unsigned int m_unEDX;
 				unsigned short m_unDX;
+
 				struct {
 					unsigned char m_unDL;
 					unsigned char m_unDH;
@@ -5987,6 +6085,7 @@ namespace Detours {
 			union {
 				unsigned int m_unEBX;
 				unsigned short m_unBX;
+
 				struct {
 					unsigned char m_unBL;
 					unsigned char m_unBH;
@@ -6031,6 +6130,7 @@ namespace Detours {
 
 			union {
 				unsigned int m_unMXCSR;
+
 				struct {
 					unsigned int m_unInvalidOperation : 1;
 					unsigned int m_unDenormalizedOperand : 1;
@@ -6116,6 +6216,7 @@ namespace Detours {
 				unsigned long long m_unRFLAGS;
 				unsigned int m_unEFLAGS;
 				unsigned short m_unFLAGS;
+
 				struct {
 					unsigned int m_unCF : 1;   // Bit 0: Carry Flag
 					unsigned int : 1;          // Bit 1: Reserved
@@ -6154,6 +6255,7 @@ namespace Detours {
 				unsigned long long m_unRAX;
 				unsigned int m_unEAX;
 				unsigned short m_unAX;
+
 				struct {
 					unsigned char m_unAL;
 					unsigned char m_unAH;
@@ -6165,6 +6267,7 @@ namespace Detours {
 				unsigned long long m_unRCX;
 				unsigned int m_unECX;
 				unsigned short m_unCX;
+
 				struct {
 					unsigned char m_unCL;
 					unsigned char m_unCH;
@@ -6176,6 +6279,7 @@ namespace Detours {
 				unsigned long long m_unRDX;
 				unsigned int m_unEDX;
 				unsigned short m_unDX;
+
 				struct {
 					unsigned char m_unDL;
 					unsigned char m_unDH;
@@ -6187,6 +6291,7 @@ namespace Detours {
 				unsigned long long m_unRBX;
 				unsigned int m_unEBX;
 				unsigned short m_unBX;
+
 				struct {
 					unsigned char m_unBL;
 					unsigned char m_unBH;
@@ -6299,6 +6404,7 @@ namespace Detours {
 
 			union {
 				unsigned int m_unMXCSR;
+
 				struct {
 					unsigned int m_unInvalidOperation : 1;
 					unsigned int m_unDenormalizedOperand : 1;
@@ -6569,8 +6675,8 @@ namespace Detours {
 			size_t m_unOriginalBytes;
 			std::unique_ptr<unsigned char[]> m_pOriginalBytes;
 		};
-	}
-}
+	} // namespace Hook
+} // namespace Detours
 
 #pragma warning(pop)
 

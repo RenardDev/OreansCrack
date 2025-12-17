@@ -1,6 +1,19 @@
 ﻿
 #include "framework.h"
 
+// Default
+#include <Windows.h>
+#include <Psapi.h>
+#include <tchar.h>
+#include <unordered_set>
+#include <vector>
+#include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <mutex>
+#include <string>
+#include <vector>
+
 // Detours
 #include "Detours/Detours.h"
 
@@ -13,35 +26,45 @@
 // HookManager
 #include "HookManager.h"
 
+// Types
+using fnDbgPrint = ULONG(NTAPI*)(PCSTR Format, ...);
+
 using fnRtlDosPathNameToNtPathName_U = BOOLEAN(NTAPI*)(PCWSTR DosName, PUNICODE_STRING NtName, PCWSTR* DosFilePath, PUNICODE_STRING NtFilePath);
+
 using fnRtlFreeUnicodeString = void(NTAPI*)(PUNICODE_STRING UnicodeString);
 using fnRtlFreeAnsiString = void(NTAPI*)(PANSI_STRING AnsiString);
-using fnNtCreateFile = NTSTATUS(NTAPI*)(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength);
-using fnNtClose = NTSTATUS(NTAPI*)(HANDLE Handle);
-using fnNtQueryInformationFile = NTSTATUS(NTAPI*)(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, FILE_INFORMATION_CLASS FileInformationClass);
-using fnRtlAllocateHeap = PVOID(NTAPI*)(PVOID HeapHandle, ULONG Flags, SIZE_T Size);
-using fnRtlFreeHeap = BOOLEAN(NTAPI*)(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress);
-using fnNtReadFile = NTSTATUS(NTAPI*)(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
-using fnNtAllocateVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect);
-using fnNtFreeVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType);
-using fnNtReadVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, ULONG NumberOfBytesToRead, PULONG NumberOfBytesReaded);
-using fnNtWriteVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, ULONG NumberOfBytesToWrite, PULONG NumberOfBytesWritten);
+
 using fnRtlInitUnicodeString = void(NTAPI*)(PUNICODE_STRING DestinationString, PCWSTR SourceString);
 using fnRtlInitAnsiString = void(NTAPI*)(PANSI_STRING DestinationString, PCSZ SourceString);
 using fnRtlUnicodeStringToAnsiString = NTSTATUS(NTAPI*)(PANSI_STRING DestinationString, PCUNICODE_STRING SourceString, BOOLEAN AllocateDestinationString);
 using fnRtlAnsiStringToUnicodeString = NTSTATUS(NTAPI*)(PUNICODE_STRING DestinationString, PCANSI_STRING SourceString, BOOLEAN AllocateDestinationString);
+
+using fnRtlAllocateHeap = PVOID(NTAPI*)(PVOID HeapHandle, ULONG Flags, SIZE_T Size);
+using fnRtlFreeHeap = BOOLEAN(NTAPI*)(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress);
+
+using fnNtAllocateVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect);
+using fnNtFreeVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType);
+using fnNtReadVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, ULONG NumberOfBytesToRead, PULONG NumberOfBytesReaded);
+using fnNtWriteVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, ULONG NumberOfBytesToWrite, PULONG NumberOfBytesWritten);
+
+using fnNtProtectVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T NumberOfBytesToProtect, ULONG NewAccessProtection, PULONG OldAccessProtection);
+using fnNtFlushInstructionCache = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, ULONG NumberOfBytesToFlush);
+
 using fnLdrLoadDll = NTSTATUS(NTAPI*)(PWSTR PathToFile, ULONG Flags, PUNICODE_STRING ModuleFileName, PHANDLE ModuleHandle);
 using fnLdrGetDllHandle = NTSTATUS(NTAPI*)(PWORD pwPath, PVOID Unused, PUNICODE_STRING ModuleFileName, PHANDLE pHModule);
 using fnLdrGetProcedureAddress = NTSTATUS(NTAPI*)(PVOID ModuleHandle, PANSI_STRING ProcedureName, ULONG Ordinal, PVOID* ProcedureAddress);
-using fnNtProtectVirtualMemory = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T NumberOfBytesToProtect, ULONG NewAccessProtection, PULONG OldAccessProtection);
-using fnNtFlushInstructionCache = NTSTATUS(NTAPI*)(HANDLE ProcessHandle, PVOID BaseAddress, ULONG NumberOfBytesToFlush);
+
 using fnDllMain = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
 
 using fnVM = void(__stdcall*)(unsigned char, unsigned int*);
 
 typedef struct _LOADER_DATA {
-	HMODULE m_hNTDLL;
 	void* m_pImageAddress;
+
+	HMODULE m_hNTDLL;
+
+	fnDbgPrint m_pDbgPrint;
+
 	fnRtlDosPathNameToNtPathName_U m_pRtlDosPathNameToNtPathName_U;
 	fnRtlFreeUnicodeString m_pRtlFreeUnicodeString;
 	fnRtlFreeAnsiString m_pRtlFreeAnsiString;
@@ -60,15 +83,71 @@ typedef struct _LOADER_DATA {
 	fnLdrLoadDll m_pLdrLoadDll;
 	fnLdrGetDllHandle m_pLdrGetDllHandle;
 	fnLdrGetProcedureAddress m_pLdrGetProcedureAddress;
+
 	TCHAR m_szTerminalSessionName[64];
 } LOADER_DATA, *PLOADER_DATA;
 
 // General definitions
 
-#define OREANSCRACK_VERSION "3.0.0"
+#define OREANSCRACK_VERSION "4.0.0"
 
 LOADER_DATA g_LoaderData;
 HMODULE g_pSelf = nullptr;
+
+DECLARE_INLINE_HOOK(
+	NtMapViewOfSection,
+	NTSTATUS,
+	NTAPI,
+	HANDLE SectionHandle, HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, SIZE_T CommitSize,
+	PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, ULONG InheritDisposition, ULONG AllocationType, ULONG Win32Protect
+);
+
+DECLARE_INLINE_HOOK(
+	NtUnmapViewOfSection,
+	NTSTATUS,
+	NTAPI,
+	HANDLE ProcessHandle, PVOID BaseAddress
+);
+
+DECLARE_INLINE_HOOK(
+	LdrLoadDll,
+	NTSTATUS,
+	NTAPI,
+	PWSTR PathToFile, ULONG Flags, PUNICODE_STRING ModuleFileName, PHANDLE ModuleHandle
+);
+
+DECLARE_INLINE_HOOK(
+	VirtualProtect,
+	BOOL,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect
+);
+
+DECLARE_INLINE_HOOK(
+	VirtualAlloc,
+	LPVOID,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect
+);
+
+DECLARE_INLINE_HOOK(
+	VirtualFree,
+	BOOL,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType
+);
+
+DECLARE_INLINE_HOOK(
+	GetForegroundWindow,
+	HWND,
+	WINAPI
+);
+
+DECLARE_INLINE_HOOK(
+	GetActiveWindow,
+	HWND,
+	WINAPI
+);
 
 DECLARE_INLINE_HOOK(
 	CreateRemoteThreadEx,
@@ -173,11 +252,6 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 		}
 
 		case 0x1B: { // Get protection macroses
-			pOriginalVM(unIndex, pData);
-			return;
-		}
-
-		case 0x1C: { // Unknown
 			pOriginalVM(unIndex, pData);
 			return;
 		}
@@ -377,51 +451,6 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 					return;
 				}
 
-				case 0x41: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x17: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x1C: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x6B: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x58: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x59: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x18: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x1A: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
-				case 0x1B: { // Unknown
-					pOriginalVM(unIndex, pData);
-					return;
-				}
-
 				case 0x65: { // Called when Cancel pressed
 					pOriginalVM(unIndex, pData);
 					return;
@@ -436,7 +465,7 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 					pOriginalVM(unIndex, pData);
 
 					LOG_DEBUG(_T("CALL MACRO (ID=0x%02X)\n"), unMacroIndex);
-					LOG_DEBUG(_T(" DATA: %08X (%08X)\n"), pMacroResult, *pMacroResult);
+					LOG_DEBUG(_T(" DATA: 0x%08X (0x%08X)\n"), pMacroResult, *pMacroResult);
 
 					return;
 				}
@@ -470,11 +499,6 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 			return;
 		}
 
-		case 0x35: { // Unknown
-			pOriginalVM(unIndex, pData);
-			return;
-		}
-
 		case 0x36: { // License Info
 			pData[10] = reinterpret_cast<unsigned int>(L"RenardDev");
 			return;
@@ -496,27 +520,7 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 			return;
 		}
 
-		case 0x46: { // Unknown
-			pOriginalVM(unIndex, pData);
-			return;
-		}
-
 		case 0x47: { // MAP list
-			pOriginalVM(unIndex, pData);
-			return;
-		}
-
-		case 0x12: { // Unknown
-			pOriginalVM(unIndex, pData);
-			return;
-		}
-
-		case 0x43: { // Unknown
-			pOriginalVM(unIndex, pData);
-			return;
-		}
-
-		case 0x30: { // Unknown
 			pOriginalVM(unIndex, pData);
 			return;
 		}
@@ -525,9 +529,9 @@ void __stdcall VM_Hook(unsigned char unIndex, unsigned int* pData) {
 			pOriginalVM(unIndex, pData);
 
 			LOG_DEBUG(_T("VM CALL (ID=0x%02X) from 0x%08X (RVA: 0x%08X)\n"), unIndex, (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
-			LOG_DEBUG(_T("  DATA: \n"));
+			LOG_DEBUG(_T("  DATA: "));
 			for (unsigned char i = 0; i < 14; ++i) {
-				GetLog().GetClient().tprintf(Terminal::COLOR::COLOR_AUTO, _T("%08X "), pData[i]);
+				GetLog().GetClient().tprintf(Terminal::COLOR::COLOR_AUTO, _T("0x%08X "), pData[i]);
 			}
 			GetLog().GetClient().tprintf(Terminal::COLOR::COLOR_AUTO, _T("\n"));
 
@@ -550,13 +554,389 @@ static bool IsAvailable() {
 	return true;
 }
 
+static void* GetLdrLoadDllAddress() {
+	HMODULE hNTDLL = GetModuleHandle(_T("ntdll.dll"));
+	return hNTDLL ? GetProcAddress(hNTDLL, "LdrLoadDll") : nullptr;
+}
+
+static void* GetFromKernel32OrBase(const char* name) {
+	HMODULE hK32 = GetModuleHandle(_T("kernel32.dll"));
+	HMODULE hKBase = GetModuleHandle(_T("kernelbase.dll"));
+	if (hK32) {
+		if (auto p = GetProcAddress(hK32, name)) return p;
+	}
+	if (hKBase) {
+		if (auto p = GetProcAddress(hKBase, name)) return p;
+	}
+	return nullptr;
+}
+
+static void* GetVirtualProtectAddress() { return GetFromKernel32OrBase("VirtualProtect"); }
+static void* GetVirtualAllocAddress() { return GetFromKernel32OrBase("VirtualAlloc"); }
+static void* GetVirtualFreeAddress() { return GetFromKernel32OrBase("VirtualFree"); }
+
+
+static void* GetForegroundWindowAddress() {
+	HMODULE hUser32 = GetModuleHandle(_T("user32.dll"));
+	return hUser32 ? GetProcAddress(hUser32, "GetForegroundWindow") : nullptr;
+}
+
+static void* GetActiveWindowAddress() {
+	HMODULE hUser32 = GetModuleHandle(_T("user32.dll"));
+	return hUser32 ? GetProcAddress(hUser32, "GetActiveWindow") : nullptr;
+}
+
 static void* GetCreateRemoteThreadExAddress() {
 	HMODULE hKernel32 = GetModuleHandle(_T("kernel32.dll"));
-	if (!hKernel32) {
-		return nullptr;
+	return hKernel32 ? GetProcAddress(hKernel32, "CreateRemoteThreadEx") : nullptr;
+}
+
+static const TCHAR* SectionInheritToString(ULONG v) {
+	switch (v) {
+	case 1:  return _T("ViewShare");
+	case 2:  return _T("ViewUnmap");
+	default: break;
+	}
+	static thread_local TCHAR b[32];
+	_stprintf_s(b, _T("%lu"), v);
+	return b;
+}
+
+static DWORD SafeGetProcessIdFromHandle(HANDLE h) {
+	// Псевдо-дескриптор текущего процесса?
+	if (h == GetCurrentProcess() || h == (HANDLE)(LONG_PTR)-1)
+		return GetCurrentProcessId();
+	DWORD pid = 0;
+	__try { pid = GetProcessId(h); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { pid = 0; }
+	return pid;
+}
+
+static void* GetNtMapViewOfSectionAddress() {
+	HMODULE ntdll = GetModuleHandle(_T("ntdll.dll"));
+	return ntdll ? GetProcAddress(ntdll, "NtMapViewOfSection") : nullptr;
+}
+
+static void* GetNtUnmapViewOfSectionAddress() {
+	HMODULE ntdll = GetModuleHandle(_T("ntdll.dll"));
+	return ntdll ? GetProcAddress(ntdll, "NtUnmapViewOfSection") : nullptr;
+}
+
+
+DEFINE_INLINE_HOOK(
+	LdrLoadDll,
+	IsAvailable,
+	GetLdrLoadDllAddress,
+	NTSTATUS,
+	NTAPI,
+	PWSTR PathToFile, ULONG Flags, PUNICODE_STRING ModuleFileName, PHANDLE ModuleHandle
+) {
+	
+
+
+	//LOG_INFO(_T("LdrLoadDll CALLED (ID=%lu) ModuleFileName=`%s` from 0x%08X (RVA: 0x%08X)\n"), GetCurrentThreadId(), ModuleFileName ? ModuleFileName->Buffer : L"", (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+
+	static bool bOnce = false;
+
+	void* pIsDemo = const_cast<void*>(Detours::Scan::FindSignature(g_pSelf, "\x55\x8B\xEC\x81\xC4\xBC\xFD\xFF\xFF\x8D")); // 55 8B EC 81 C4 BC FD FF FF 8D
+	if (pIsDemo && !bOnce) {
+		bOnce = true;
+
+		MEMORY_BASIC_INFORMATION mbi{};
+
+		unsigned char* pCallVM = reinterpret_cast<unsigned char*>(pIsDemo) + 0xF;
+		pOriginalVM = reinterpret_cast<fnVM>(Detours::rddisasm::RdGetAddressFromRelOrDisp(pCallVM));
+		if (pOriginalVM) {
+			if (VirtualQuery(pOriginalVM, &mbi, sizeof(mbi))) {
+
+				// Main Executable <-> SecureEngine <-> WinAPIs
+
+				LOG_DEBUG(_T("SecureEngine\n"));
+				LOG_DEBUG(_T("  BASE = 0x%08X\n"), reinterpret_cast<size_t>(mbi.BaseAddress));
+				LOG_DEBUG(_T("  SIZE = 0x%08X\n"), mbi.RegionSize);
+				//exit(1);
+			}
+
+			unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
+			Detours::Memory::Protection Patch(pMOV, 1, false);
+			if (Patch.Change(PAGE_EXECUTE_READWRITE)) {
+				pMOV[0] = 0;
+				Patch.Restore();
+			}
+
+			if (reinterpret_cast<unsigned char*>(pOriginalVM)[0] == 0xFF) {
+				RawVMHook.Set(pOriginalVM);
+				RawVMHook.Hook(VMHook, true);
+				LOG_INFO(_T("Hooked VM CALL!\n"));
+			}
+		}
 	}
 
-	return GetProcAddress(hKernel32, "CreateRemoteThreadEx");
+	return g_HookLdrLoadDll.Call(PathToFile, Flags, ModuleFileName, ModuleHandle);
+}
+
+static const TCHAR* ProtToString(DWORD fl) {
+	static thread_local TCHAR buf[128];
+	buf[0] = 0;
+
+	auto add = [](TCHAR* dst, size_t cap, const TCHAR* s) {
+		if (dst[0]) _tcscat_s(dst, cap, _T("|"));
+		_tcscat_s(dst, cap, s);
+		};
+
+	const DWORD base = (fl & 0xFF);
+	switch (base) {
+	case PAGE_NOACCESS:          add(buf, _countof(buf), _T("NOACCESS"));          break;
+	case PAGE_READONLY:          add(buf, _countof(buf), _T("R"));                 break;
+	case PAGE_READWRITE:         add(buf, _countof(buf), _T("RW"));                break;
+	case PAGE_WRITECOPY:         add(buf, _countof(buf), _T("WC"));                break;
+	case PAGE_EXECUTE:           add(buf, _countof(buf), _T("X"));                 break;
+	case PAGE_EXECUTE_READ:      add(buf, _countof(buf), _T("XR"));                break;
+	case PAGE_EXECUTE_READWRITE: add(buf, _countof(buf), _T("XRW"));               break;
+	case PAGE_EXECUTE_WRITECOPY: add(buf, _countof(buf), _T("XWC"));               break;
+	default: _stprintf_s(buf, _T("0x%08X"), fl);                                   break;
+	}
+
+	if (fl & PAGE_GUARD)        add(buf, _countof(buf), _T("GUARD"));
+	if (fl & PAGE_NOCACHE)      add(buf, _countof(buf), _T("NOCACHE"));
+	if (fl & PAGE_WRITECOMBINE) add(buf, _countof(buf), _T("WRITECOMB"));
+
+	return buf;
+}
+
+static const TCHAR* AllocTypeToString(DWORD t) {
+	static thread_local TCHAR buf[128];
+	buf[0] = 0;
+	auto add = [](TCHAR* dst, size_t cap, const TCHAR* s) {
+		if (dst[0]) _tcscat_s(dst, cap, _T("|"));
+		_tcscat_s(dst, cap, s);
+		};
+
+	if (t & MEM_COMMIT)        add(buf, _countof(buf), _T("COMMIT"));
+	if (t & MEM_RESERVE)       add(buf, _countof(buf), _T("RESERVE"));
+	if (t & MEM_RESET)         add(buf, _countof(buf), _T("RESET"));
+	if (t & MEM_RESET_UNDO)    add(buf, _countof(buf), _T("RESET_UNDO"));
+	if (t & MEM_LARGE_PAGES)   add(buf, _countof(buf), _T("LARGE_PAGES"));
+	if (t & MEM_PHYSICAL)      add(buf, _countof(buf), _T("PHYSICAL"));
+	if (t & MEM_TOP_DOWN)      add(buf, _countof(buf), _T("TOP_DOWN"));
+	if (t & MEM_WRITE_WATCH)   add(buf, _countof(buf), _T("WRITE_WATCH"));
+
+	if (!buf[0]) _stprintf_s(buf, _T("0x%08X"), t);
+	return buf;
+}
+
+static const TCHAR* FreeTypeToString(DWORD t) {
+	switch (t) {
+	case MEM_DECOMMIT: return _T("DECOMMIT");
+	case MEM_RELEASE:  return _T("RELEASE");
+	default:           break;
+	}
+	static thread_local TCHAR buf[32];
+	_stprintf_s(buf, _T("0x%08X"), t);
+	return buf;
+}
+
+static bool IsExecProtect(DWORD fl) {
+	const DWORD base = (fl & 0xFF);
+	return base == PAGE_EXECUTE || base == PAGE_EXECUTE_READ ||
+		base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
+}
+
+
+DEFINE_INLINE_HOOK(
+	VirtualProtect,
+	IsAvailable,
+	GetVirtualProtectAddress,
+	BOOL,
+	WINAPI,
+	LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect
+) {
+	static thread_local bool reenter = false;
+	if (reenter) {
+		return g_HookVirtualProtect.Call(lpAddress, dwSize, flNewProtect, lpflOldProtect);
+	}
+	reenter = true;
+
+	//LOG_INFO(_T("VirtualProtect CALLED (TID=%lu) addr=%p size=0x%IX new=%s (0x%08X) from 0x%08X (RVA: 0x%08X)\n"),
+	//	GetCurrentThreadId(),
+	//	lpAddress,
+	//	(SIZE_T)dwSize,
+	//	ProtToString(flNewProtect), flNewProtect,
+	//	(unsigned int)_ReturnAddress(),
+	//	(unsigned int)_ReturnAddress() - (unsigned int)g_pSelf
+	//);
+
+	static bool bOnce = false;
+
+	void* pIsDemo = const_cast<void*>(Detours::Scan::FindSignature(g_pSelf, "\x55\x8B\xEC\x81\xC4\xBC\xFD\xFF\xFF\x8D")); // 55 8B EC 81 C4 BC FD FF FF 8D
+	if (pIsDemo && !bOnce) {
+		bOnce = true;
+
+		MEMORY_BASIC_INFORMATION mbi{};
+
+		unsigned char* pCallVM = reinterpret_cast<unsigned char*>(pIsDemo) + 0xF;
+		pOriginalVM = reinterpret_cast<fnVM>(Detours::rddisasm::RdGetAddressFromRelOrDisp(pCallVM));
+		if (pOriginalVM) {
+			if (VirtualQuery(pOriginalVM, &mbi, sizeof(mbi))) {
+
+				// Main Executable <-> SecureEngine <-> WinAPIs
+
+				LOG_DEBUG(_T("SecureEngine\n"));
+				LOG_DEBUG(_T("  BASE = 0x%08X\n"), reinterpret_cast<size_t>(mbi.BaseAddress));
+				LOG_DEBUG(_T("  SIZE = 0x%08X\n"), mbi.RegionSize);
+				//exit(1);
+			}
+
+			unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
+			Detours::Memory::Protection Patch(pMOV, 1, false);
+			if (Patch.Change(PAGE_EXECUTE_READWRITE)) {
+				pMOV[0] = 0;
+				Patch.Restore();
+			}
+
+			if (reinterpret_cast<unsigned char*>(pOriginalVM)[0] == 0xFF) {
+				RawVMHook.Set(pOriginalVM);
+				RawVMHook.Hook(VMHook, true);
+				LOG_INFO(_T("Hooked VM CALL!\n"));
+			}
+		}
+	}
+
+	BOOL ok = g_HookVirtualProtect.Call(lpAddress, dwSize, flNewProtect, lpflOldProtect);
+
+	if (ok) {
+		DWORD oldProt = lpflOldProtect ? *lpflOldProtect : 0xFFFFFFFF;
+		LOG_DEBUG(_T("  -> OK, old=%s (0x%08X)\n"), ProtToString(oldProt), oldProt);
+
+		// Опциональный авто-дамп при установке исполняемой защиты
+		static const SIZE_T MAX_DUMP_BYTES = (16ull * 1024 * 1024); // 16 MB safety cap
+		if (IsExecProtect(flNewProtect) && lpAddress && dwSize) {
+			SIZE_T toDump = dwSize > MAX_DUMP_BYTES ? MAX_DUMP_BYTES : dwSize;
+			TCHAR name[128];
+			_stprintf_s(name, _T("dump_exec_%p_%IX.bin"), lpAddress, (SIZE_T)toDump);
+			//DumpRegion(name, lpAddress, (DWORD)toDump);
+		}
+	}
+	else {
+		LOG_WARNING(_T("  -> FAIL (GLE=%lu)\n"), GetLastError());
+	}
+
+	reenter = false;
+	return ok;
+}
+
+
+DEFINE_INLINE_HOOK(
+	GetForegroundWindow,
+	IsAvailable,
+	GetForegroundWindowAddress,
+	HWND,
+	WINAPI
+) {
+	LOG_INFO(_T("GetForegroundWindow CALLED (ID=%lu) from 0x%08X (RVA: 0x%08X)\n"), GetCurrentThreadId(), (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+
+	static bool bOnce = false;
+
+	void* pIsDemo = const_cast<void*>(Detours::Scan::FindSignature(g_pSelf, "\x55\x8B\xEC\x81\xC4\xBC\xFD\xFF\xFF\x8D")); // 55 8B EC 81 C4 BC FD FF FF 8D
+	if (pIsDemo && !bOnce) {
+		bOnce = true;
+
+		MEMORY_BASIC_INFORMATION mbi{};
+
+		unsigned char* pCallVM = reinterpret_cast<unsigned char*>(pIsDemo) + 0xF;
+		pOriginalVM = reinterpret_cast<fnVM>(Detours::rddisasm::RdGetAddressFromRelOrDisp(pCallVM));
+		if (pOriginalVM) {
+			if (VirtualQuery(pOriginalVM, &mbi, sizeof(mbi))) {
+
+				// Main Executable <-> SecureEngine <-> WinAPIs
+
+				LOG_DEBUG(_T("SecureEngine\n"));
+				LOG_DEBUG(_T("  BASE = 0x%08X\n"), reinterpret_cast<size_t>(mbi.BaseAddress));
+				LOG_DEBUG(_T("  SIZE = 0x%08X\n"), mbi.RegionSize);
+				//exit(1);
+			}
+
+			unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
+			Detours::Memory::Protection Patch(pMOV, 1, false);
+			if (Patch.Change(PAGE_EXECUTE_READWRITE)) {
+				pMOV[0] = 0;
+				Patch.Restore();
+			}
+
+			if (reinterpret_cast<unsigned char*>(pOriginalVM)[0] == 0xFF) {
+				RawVMHook.Set(pOriginalVM);
+				RawVMHook.Hook(VMHook, true);
+				LOG_INFO(_T("Hooked VM CALL!\n"));
+			}
+		}
+	}
+
+	return nullptr; // Prevent x64dbg detection
+}
+
+DEFINE_INLINE_HOOK(
+	GetActiveWindow,
+	IsAvailable,
+	GetActiveWindowAddress,
+	HWND,
+	WINAPI
+) {
+	LOG_INFO(_T("GetActiveWindow CALLED (ID=%lu) from 0x%08X (RVA: 0x%08X)\n"), GetCurrentThreadId(), (unsigned int)_ReturnAddress(), (unsigned int)_ReturnAddress() - (unsigned int)g_pSelf);
+
+	static bool bOnce = false;
+
+	void* pIsDemo = const_cast<void*>(Detours::Scan::FindSignature(g_pSelf, "\x55\x8B\xEC\x81\xC4\xBC\xFD\xFF\xFF\x8D")); // 55 8B EC 81 C4 BC FD FF FF 8D
+	if (pIsDemo && !bOnce) {
+		bOnce = true;
+
+		MEMORY_BASIC_INFORMATION mbi{};
+
+		unsigned char* pCallVM = reinterpret_cast<unsigned char*>(pIsDemo) + 0xF;
+		pOriginalVM = reinterpret_cast<fnVM>(Detours::rddisasm::RdGetAddressFromRelOrDisp(pCallVM));
+		if (pOriginalVM) {
+			if (VirtualQuery(pOriginalVM, &mbi, sizeof(mbi))) {
+
+				// Main Executable <-> SecureEngine <-> WinAPIs
+
+				LOG_DEBUG(_T("SecureEngine\n"));
+				LOG_DEBUG(_T("  BASE = 0x%08X\n"), reinterpret_cast<size_t>(mbi.BaseAddress));
+				LOG_DEBUG(_T("  SIZE = 0x%08X\n"), mbi.RegionSize);
+				//exit(1);
+			}
+
+			unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
+			Detours::Memory::Protection Patch(pMOV, 1, false);
+			if (Patch.Change(PAGE_EXECUTE_READWRITE)) {
+				pMOV[0] = 0;
+				Patch.Restore();
+			}
+
+			if (reinterpret_cast<unsigned char*>(pOriginalVM)[0] == 0xFF) {
+				RawVMHook.Set(pOriginalVM);
+				RawVMHook.Hook(VMHook, true);
+				LOG_INFO(_T("Hooked VM CALL!\n"));
+			}
+		}
+	}
+
+	return nullptr; // Prevent x64dbg detection
+}
+
+void DumpRegion(const TCHAR* szFileName, void* pData, DWORD unSize) {
+	HANDLE hFile = CreateFile(szFileName, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (!hFile || (hFile == INVALID_HANDLE_VALUE)) {
+		LOG_WARNING(_T("CreateFile FAIL, GLE=%u\n"), GetLastError());
+	} else {
+		DWORD nWritten = 0;
+		if (!WriteFile(hFile, pData, unSize, &nWritten, nullptr) || (nWritten != unSize)) {
+			LOG_DEBUG(_T("WriteFile FAIL, GLE=%u\n"), GetLastError());
+			DeleteFile(szFileName);
+		} else {
+			LOG_DEBUG(_T("DUMP '%s' OK (%u BYTES)\n"), szFileName, nWritten);
+		}
+
+		CloseHandle(hFile);
+	}
 }
 
 DEFINE_INLINE_HOOK(
@@ -567,24 +947,41 @@ DEFINE_INLINE_HOOK(
 	WINAPI,
 	HANDLE hProcess, LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, LPDWORD lpThreadId
 ) {
+	Detours::Exception::g_ExceptionListener.RefreshHandler();
+
 	static bool bOnce = false;
 
 	void* pIsDemo = const_cast<void*>(Detours::Scan::FindSignature(g_pSelf, "\x55\x8B\xEC\x81\xC4\xBC\xFD\xFF\xFF\x8D")); // 55 8B EC 81 C4 BC FD FF FF 8D
 	if (pIsDemo && !bOnce) {
 		bOnce = true;
-		unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
-		Detours::Memory::Protection Patch(pMOV, 1, false);
-		Patch.Change(PAGE_EXECUTE_READWRITE);
-		pMOV[0] = 0;
-		Patch.Restore();
 
-		unsigned char* pCallVM = reinterpret_cast<unsigned char*>(pIsDemo) + 0x10;
-		pOriginalVM = reinterpret_cast<fnVM>(reinterpret_cast<unsigned int>(pCallVM) + sizeof(unsigned int) + (*reinterpret_cast<unsigned int*>(pCallVM)));
+		MEMORY_BASIC_INFORMATION mbi {};
 
-		if (reinterpret_cast<unsigned char*>(pOriginalVM)[0] == 0xFF) {
-			RawVMHook.Set(pOriginalVM);
-			RawVMHook.Hook(VMHook, true);
-			LOG_INFO(_T("[+] Hooked VM CALL!\n"));
+		unsigned char* pCallVM = reinterpret_cast<unsigned char*>(pIsDemo) + 0xF;
+		pOriginalVM = reinterpret_cast<fnVM>(Detours::rddisasm::RdGetAddressFromRelOrDisp(pCallVM));
+		if (pOriginalVM) {
+			if (VirtualQuery(pOriginalVM, &mbi, sizeof(mbi))) {
+
+				// Main Executable <-> SecureEngine <-> WinAPIs
+
+				LOG_DEBUG(_T("SecureEngine\n"));
+				LOG_DEBUG(_T("  BASE = 0x%08X\n"), reinterpret_cast<size_t>(mbi.BaseAddress));
+				LOG_DEBUG(_T("  SIZE = 0x%08X\n"), mbi.RegionSize);
+				//exit(1);
+			}
+
+			unsigned char* pMOV = reinterpret_cast<unsigned char*>(pIsDemo) + 0x1D;
+			Detours::Memory::Protection Patch(pMOV, 1, false);
+			if (Patch.Change(PAGE_EXECUTE_READWRITE)) {
+				pMOV[0] = 0;
+				Patch.Restore();
+			}
+
+			if (reinterpret_cast<unsigned char*>(pOriginalVM)[0] == 0xFF) {
+				RawVMHook.Set(pOriginalVM);
+				RawVMHook.Hook(VMHook, true);
+				LOG_INFO(_T("Hooked VM CALL!\n"));
+			}
 		}
 	}
 
@@ -623,9 +1020,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 			}
 
 			LOG_INFO(_T("Loaded successful.\n"));
-
 			break;
 		}
+
 		case DLL_THREAD_ATTACH:
 		case DLL_THREAD_DETACH:
 		case DLL_PROCESS_DETACH:
